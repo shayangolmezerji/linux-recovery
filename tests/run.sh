@@ -670,6 +670,44 @@ test_probe_degrades_to_the_timer() {
   expect_rc 0 'cleanup disarm'
 }
 
+test_ipv6_tuple_falls_back_to_the_timer() {
+  section 'an IPv6 peer is refused as a socket probe, not read as a dead session'
+  # An IPv6 address already contains colons, so the endpoint string built from it
+  # is ambiguous and does not reliably match what ss prints. pick_probe therefore
+  # accepts dotted-quad only. The dangerous part is not the refusal, it is what a
+  # refusal must not be allowed to look like: with --grace 0, reading the session
+  # as gone would roll back a live IPv6 operator's box in seconds.
+  local n=0 tuple id
+  for tuple in '[2001:db8::1] 45455 192.0.2.2 22' '2001:db8::1 45455 192.0.2.2 22'; do
+    n=$((n + 1))
+    id="ipv6-$n"
+    SS_TUPLE=$tuple
+    printf '[2001:db8::1]:45455 192.0.2.2:22\n' >"$SSTABLE"
+    run_with_ss --id "$id" --ttl 60 --interval 1 --grace 0 --hook 50-alpha arm
+    expect_rc 0 "arm with '$tuple' exits 0"
+    expect_absent 'probe=socket' "the IPv6 tuple is not picked as a probe ($n)"
+    run --id "$id" status
+    expect_out 'probe=none' "session $n runs on the timer"
+  done
+  # The table and the tuples stay as they are: a watchdog that cannot read the
+  # session must wait for the ttl like any other, so nothing fires here.
+  if waits_for 4 has_marker "$(session_dir ipv6-1)/ROLLED_BACK" ||
+    has_marker "$(session_dir ipv6-2)/ROLLED_BACK"; then
+    bad 'a refused IPv6 tuple was read as a dropped session'
+    dump_log ipv6-1
+    dump_log ipv6-2
+  else
+    ok 'a refused IPv6 tuple did not fire the rollback'
+  fi
+  session_state_is ipv6-1 armed && ok 'the first session is still armed' || bad 'ipv6-1 is not armed'
+  session_state_is ipv6-2 armed && ok 'the second session is still armed' || bad 'ipv6-2 is not armed'
+  run --id ipv6-1 disarm
+  expect_rc 0 'cleanup disarm of the first'
+  run --id ipv6-2 disarm
+  expect_rc 0 'cleanup disarm of the second'
+  printf '%s\n' "${SS_ROWS[0]}" >"$SSTABLE"
+}
+
 test_extend_moves_the_deadline() {
   section 'extend moves the deadline of an armed session'
   run --id longer --ttl 60 --hook 50-alpha arm
@@ -819,6 +857,7 @@ test_socket_probe_reads_either_layout
 test_socket_loss_cuts_the_deadline
 test_unreadable_socket_is_not_a_gone_session
 test_probe_degrades_to_the_timer
+test_ipv6_tuple_falls_back_to_the_timer
 test_extend_moves_the_deadline
 test_expiry_rolls_back_newest_first
 test_recover_rolls_back_after_a_reboot
