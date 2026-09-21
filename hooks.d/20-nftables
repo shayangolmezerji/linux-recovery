@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# Rollback hook for nftables. Captures the whole ruleset before the change and
+# reloads it if the switch fires.
+#
+# Contract (see the "Writing a hook" section of README.md):
+#   $1 = save | restore
+#   $2 = directory this hook's snapshots live in
+#   exit 77 = nothing applicable on this host
+set -euo pipefail
+
+DM_LIB_DIR=${DEADMAN_LIB:-$(dirname "$(dirname "$(readlink -f -- "${BASH_SOURCE[0]}")")")/lib}
+# shellcheck source=lib/deadman-lib.sh
+. "$DM_LIB_DIR/deadman-lib.sh"
+
+action=${1:-}
+snap=${2:-}
+if [[ -z $action || -z $snap ]]; then
+  dm_die "usage: $(basename "$0") save|restore <snapshot-dir>"
+fi
+
+# Skipped in dry-run: nothing here calls nft, so a host without it can still
+# watch the plan. Real runs keep the exit-77 signal for "no nft on this box".
+if ! dm_is_dry_run; then
+  dm_require_cmd nft
+fi
+
+case $action in
+save)
+  dm_capture "$snap/ruleset.nft" nft list ruleset
+  ;;
+restore)
+  if [[ ! -s $snap/ruleset.nft ]]; then
+    dm_die "restore asked for $snap/ruleset.nft and it is empty"
+  fi
+  # `nft -f` merges instead of replacing, so the rules the risky change added
+  # would survive a reload. Flushing first is the difference between a rollback
+  # and a reconciliation. Atomic ruleset namespace swap is cleaner still, but it
+  # only helps for tables the operator owns, not for the system ruleset.
+  dm_priv nft flush ruleset
+  dm_priv nft -f "$snap/ruleset.nft"
+  ;;
+*)
+  dm_die "unknown action '$action'"
+  ;;
+esac

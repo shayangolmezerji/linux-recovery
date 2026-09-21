@@ -1,0 +1,880 @@
+#!/usr/bin/env bash
+# deadman-ssh - a per-user dead man's switch for remote administration.
+#
+# Arm it before a risky network or firewall change. A detached watchdog counts
+# down; if the TTL expires without a confirmation, the rollback hooks restore
+# the state captured at arm time. Everything lives under the user's state
+# directory, and DEADMAN_DRY_RUN=1 makes the whole sequence observable without
+# root.
+set -euo pipefail
+umask 077
+
+DM_SELF=$(readlink -f -- "${BASH_SOURCE[0]}")
+DM_ROOT=$(dirname "$(dirname "$DM_SELF")")
+: "${DEADMAN_LIB:=$DM_ROOT/lib}"
+# shellcheck source=lib/deadman-lib.sh
+. "$DEADMAN_LIB/deadman-lib.sh"
+: "${DEADMAN_HOOKS_DIR:=$DM_ROOT/hooks.d}"
+
+# Defaults for the options below. --ttl 300s is deliberately short: long enough
+# to verify a firewall change from a second machine, short enough that an
+# abandoned session restores itself before you notice it is gone.
+DM_TTL=300
+DM_INTERVAL=2
+DM_GRACE=10
+DM_ID=''
+DM_REASON='requested'
+DM_PURGE=0
+DM_FORCE=0
+DM_HOOK_NAMES=()
+DM_HOOK_PATHS=()
+DM_SAVED_HOOKS=()
+DM_OPTS=()
+DM_PAYLOAD=()
+
+usage() {
+  cat <<'EOF'
+deadman-ssh - arm a rollback you can stop, or let it fire
+
+Usage:
+  deadman-ssh arm        [--ttl 5m] [--hook NAME]... [-- <risky command> ...]
+  deadman-ssh confirm    [id]
+  deadman-ssh extend     [id] [--ttl 10m]
+  deadman-ssh status     [id]
+  deadman-ssh disarm     [id] [--purge]
+  deadman-ssh rollback   [id] [--reason TEXT]
+  deadman-ssh recover    [id]
+  deadman-ssh hooks
+  deadman-ssh help
+
+Except for arm, one operand after the command names the session; --id wins if
+both are given. arm takes no operands: a risky command goes after --.
+The internal command `watch` is what the detached watchdog runs; do not call it.
+
+Options (recognized before or after the command word):
+  --ttl SECS        seconds before rollback fires (default 300)
+  --id ID           session name, default user@host so a reconnect reuses it
+  --interval SECS   watchdog poll period (default 2)
+  --grace SECS      seconds of grace after the session drops (default 10)
+  --hook NAME       hook to run, repeatable or comma separated; default is
+                    every executable in the hook directory
+  --opt KEY=VALUE   passed to hooks as DEADMAN_OPT_KEY, repeatable
+  --force           replace a session that already finished
+  --reason TEXT     recorded in the log with the rollback
+  --purge           with disarm, delete the snapshots too
+
+Environment:
+  DEADMAN_DRY_RUN=1   print every privileged action instead of running it
+  DEADMAN_RUNNER      words used to gain privilege (default: "sudo -n")
+  DEADMAN_STATE_DIR   where sessions live (default: $XDG_STATE_HOME/deadman-ssh)
+  DEADMAN_HOOKS_DIR   hook directory (default: hooks.d next to this script)
+  DM_SESSION_PID      shell pid to treat as the session when SSH_CONNECTION
+                      is absent, e.g. for a change made from cron or `at`
+
+Exit codes:
+  0 ok   1 failure   2 usage error   3 refused, session already armed
+  4 rollback completed
+EOF
+}
+
+die_usage() {
+  printf 'deadman: %s\n' "$*" >&2
+  printf 'Run deadman-ssh help for the option list.\n' >&2
+  exit 2
+}
+
+default_id() {
+  printf '%s@%s\n' "$(id -un)" "$(uname -n)"
+}
+
+iso_of() {
+  local epoch="$1"
+  [[ $epoch =~ ^[0-9]+$ ]] || {
+    printf '%s\n' "${epoch:-unknown}"
+    return 0
+  }
+  date -u -d "@$epoch" +'%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || printf 'epoch:%ss\n' "$epoch"
+}
+
+# --- session files -----------------------------------------------------
+
+watch_pid_file() {
+  printf '%s\n' "$(dm_session_dir "$1")/watchpid"
+}
+
+snapshot_dir_for() {
+  printf '%s\n' "$(dm_session_dir "$1")/snapshots/$2"
+}
+
+session_pid_of() {
+  local file
+  file=$(watch_pid_file "$1")
+  [[ -f $file ]] && cat "$file" || printf '\n'
+}
+
+# A session carries how it wants to be run. After a reboot the watchdog has to
+# be restarted by a shell that shares no environment with the one that armed
+# the switch, so dry-run, runner and hook directory come from the state file.
+session_export_env() {
+  local file="$1" value
+  value=$(dm_state_get "$file" dry_run) || value=''
+  [[ $value == 1 ]] && export DEADMAN_DRY_RUN=1
+  value=$(dm_state_get "$file" runner) || value=''
+  [[ -n $value ]] && export DEADMAN_RUNNER="$value"
+  value=$(dm_state_get "$file" hooks_dir) || value=''
+  [[ -n $value ]] && export DEADMAN_HOOKS_DIR="$value"
+  value=$(dm_state_get "$file" state_dir) || value=''
+  [[ -n $value ]] && export DEADMAN_STATE_DIR="$value"
+  return 0
+}
+
+# --- hooks -------------------------------------------------------------
+# The hook directory is the extension point: nothing in this file knows what a
+# netplan or an nftables rollback is. A hook is an executable named after the
+# change class, called with `save <dir>` before the change and `restore <dir>`
+# afterwards. Exit 77 means "not applicable here".
+
+available_hooks() {
+  local entry
+  [[ -d $DEADMAN_HOOKS_DIR ]] || return 0
+  for entry in "$DEADMAN_HOOKS_DIR"/*; do
+    [[ -f $entry && -x $entry ]] || continue
+    printf '%s\n' "$(basename "$entry")"
+  done
+  return 0
+}
+
+add_hook_name() {
+  local raw="$1" piece
+  local -a pieces
+  IFS=',' read -r -a pieces <<<"$raw"
+  for piece in "${pieces[@]}"; do
+    [[ -z $piece ]] && continue
+    DM_HOOK_NAMES+=("$piece")
+  done
+  return 0
+}
+
+resolve_hooks() {
+  local name path
+  DM_HOOK_PATHS=()
+  if ((${#DM_HOOK_NAMES[@]} == 0)); then
+    while IFS= read -r name; do
+      [[ -n $name ]] && DM_HOOK_PATHS+=("$DEADMAN_HOOKS_DIR/$name")
+    done < <(available_hooks)
+    return 0
+  fi
+  for name in "${DM_HOOK_NAMES[@]}"; do
+    path="$DEADMAN_HOOKS_DIR/$name"
+    [[ -f $path && -x $path ]] ||
+      die_usage "no executable hook named '$name' in $DEADMAN_HOOKS_DIR"
+    DM_HOOK_PATHS+=("$path")
+  done
+  return 0
+}
+
+run_hook() {
+  local action="$1" hook="$2" snap="$3" name rc=0
+  name=$(basename "$hook")
+  mkdir -p "$snap"
+  "$hook" "$action" "$snap" || rc=$?
+  case $rc in
+  0) dm_log "hook $name: $action ok" ;;
+  "$DM_EX_SKIP") dm_log "hook $name: $action skipped" ;;
+  *) dm_log "hook $name: $action FAILED (rc=$rc)" ;;
+  esac
+  return "$rc"
+}
+
+export_opts() {
+  local pair key
+  for pair in "${DM_OPTS[@]+"${DM_OPTS[@]}"}"; do
+    key=${pair%%=*}
+    export "DEADMAN_OPT_${key^^}=${pair#*=}"
+  done
+  return 0
+}
+
+# --- session liveness --------------------------------------------------
+
+# Three probes, best available first. Only the first two can tell a dropped
+# session from a session that is merely quiet, and neither is allowed to guess:
+# an unusable probe degrades to the timer instead of to an early rollback.
+#
+# pick_probe records the tuple while the session is definitely up, so a probe
+# that cannot be verified right now is dropped rather than trusted.
+pick_probe() {
+  local client_ip client_port server_ip server_port
+  if [[ -n ${SSH_CONNECTION:-} ]]; then
+    read -r client_ip client_port server_ip server_port <<<"$SSH_CONNECTION"
+    if [[ $client_ip =~ ^[0-9.]+$ && $server_ip =~ ^[0-9.]+$ &&
+      $client_port =~ ^[0-9]+$ && $server_port =~ ^[0-9]+$ ]]; then
+      case $(socket_state "$server_ip:$server_port" "$client_ip:$client_port") in
+      present)
+        printf 'socket %s:%s %s:%s\n' "$server_ip" "$server_port" "$client_ip" "$client_port"
+        return 0
+        ;;
+      # The caller captures stdout as the probe tuple, so the explanation of
+      # why a probe was dropped goes to stderr instead of into that value.
+      unknown) dm_log "probe: SSH_CONNECTION is set but the socket table could not be read" >&2 ;;
+      gone) dm_log "probe: SSH_CONNECTION is set but no such established socket exists" >&2 ;;
+      esac
+    fi
+  fi
+  if [[ -n ${DM_SESSION_PID:-} ]]; then
+    [[ $DM_SESSION_PID =~ ^[0-9]+$ ]] || die_usage "DM_SESSION_PID must be a number"
+    printf 'pid %s\n' "$DM_SESSION_PID"
+    return 0
+  fi
+  printf 'none\n'
+}
+
+# Prints present, gone or unknown. unknown exists so that a host where ss is
+# missing or refusing to answer is never read as "the operator disconnected".
+socket_state() {
+  local local_ep="$1" peer_ep="$2" out rc=0
+  command -v ss >/dev/null 2>&1 || {
+    printf 'unknown\n'
+    return 0
+  }
+  out=$(ss -Htn state established 2>/dev/null) || rc=$?
+  if ((rc != 0)); then
+    printf 'unknown\n'
+    return 0
+  fi
+  if awk -v l="$local_ep" -v p="$peer_ep" '
+    $3 == l && $4 == p { found = 1 }
+    END { exit !found }
+  ' <<<"$out"; then
+    printf 'present\n'
+  else
+    printf 'gone\n'
+  fi
+  return 0
+}
+
+# Reads `probe` back from the state file. Always conservative: a probe that
+# cannot answer reports the session as alive, and the TTL is what decides.
+session_is_live() {
+  local file="$1" probe
+  local -a args
+  probe=$(dm_state_get "$file" probe 2>/dev/null) || probe='none'
+  read -r -a args <<<"$probe"
+  case ${args[0]} in
+  pid)
+    dm_pid_alive "${args[1]:-}"
+    ;;
+  socket)
+    local state
+    state=$(socket_state "${args[1]:-}" "${args[2]:-}")
+    [[ $state != gone ]]
+    ;;
+  *)
+    return 0
+    ;;
+  esac
+}
+
+# --- rollback ----------------------------------------------------------
+
+# Only hooks whose save step reported ok are restored, newest first. A failing
+# hook does not stop the rest: a half-restored host needs every remaining hook
+# attempted and a complete record of what broke.
+do_rollback() {
+  local id="$1" reason="$2" file index hook snap failures=0
+  local -a saved
+  file=$(dm_state_file "$id")
+  read -r -a saved <<<"$(dm_state_get "$file" hooks_saved 2>/dev/null || true)"
+  dm_log "rollback[$reason]: $(( ${#saved[@]} )) hook(s) to restore, newest first"
+  for ((index = ${#saved[@]} - 1; index >= 0; index--)); do
+    hook="$DEADMAN_HOOKS_DIR/${saved[index]}"
+    snap=$(snapshot_dir_for "$id" "${saved[index]}")
+    if [[ ! -x $hook ]]; then
+      dm_warn "rollback[$reason]: hook ${saved[index]} is gone from $DEADMAN_HOOKS_DIR"
+      failures=$((failures + 1))
+      continue
+    fi
+    run_hook restore "$hook" "$snap" || failures=$((failures + 1))
+  done
+  if ((${#saved[@]} == 0)); then
+    dm_warn "rollback[$reason]: nothing was captured, there is no state to restore"
+  fi
+  if ((failures == 0)); then
+    dm_state_set "$file" state 'rolled-back'
+    dm_state_set "$file" rolled_back_at "$(dm_now_iso)"
+    printf '%s reason=%s\n' "$(dm_now_iso)" "$reason" >"$(dm_session_dir "$id")/ROLLED_BACK"
+    dm_log "rollback[$reason]: complete"
+    return 4
+  fi
+  dm_state_set "$file" state 'rollback-failed'
+  dm_state_set "$file" failed_reason "$reason"
+  dm_warn "rollback[$reason]: $failures hook(s) failed, the host may be in a mixed state"
+  return 1
+}
+
+stop_watchdog() {
+  local id="$1" pid
+  pid=$(session_pid_of "$id")
+  if dm_pid_alive "$pid"; then
+    kill "$pid" 2>/dev/null || true
+    dm_log "watchdog $pid stopped"
+  fi
+  return 0
+}
+
+# setsid detaches the watchdog from the session being risked: if the shell dies
+# when the change lands, the process watching it must not die in the same blow.
+start_watchdog() {
+  local id="$1" dir
+  dir=$(dm_session_dir "$id")
+  setsid nohup "$DM_SELF" watch --id "$id" >>"$dir/log" 2>&1 </dev/null &
+  printf '%s\n' "$!" >"$(watch_pid_file "$id")"
+  dm_log "watchdog started (pid $!)"
+  return 0
+}
+
+# --- commands ----------------------------------------------------------
+
+cmd_arm() {
+  local id ttl probe deadline session file snapshots hook name rc
+
+  ttl=$(dm_parse_ttl "$DM_TTL")
+
+  id=${DM_ID:-$(default_id)}
+  session=$(dm_session_dir "$id")
+  file=$(dm_state_file "$id")
+  guard_existing_session "$id" || return $?
+
+  resolve_hooks
+  ((${#DM_HOOK_PATHS[@]} > 0)) || die_usage "no hooks found in $DEADMAN_HOOKS_DIR"
+
+  export DEADMAN_LIB
+  export_opts
+  probe=$(pick_probe)
+
+  deadline=$(( $(dm_now) + ttl ))
+
+  # mkdir is the lock; two arms of the same id cannot both win this race.
+  mkdir -p "$(dm_state_dir)/sessions"
+  if ! mkdir "$session" 2>/dev/null; then
+    guard_existing_session "$id" || return $?
+    die_usage "session directory $session exists with no state file, remove it by hand"
+  fi
+  snapshots="$session/snapshots"
+  mkdir -p "$snapshots"
+
+  {
+    printf 'id=%s\n' "$id"
+    printf 'state=armed\n'
+    printf 'armed_at=%s\n' "$(dm_now_iso)"
+    printf 'ttl=%s\n' "$ttl"
+    printf 'interval=%s\n' "$DM_INTERVAL"
+    printf 'grace=%s\n' "$DM_GRACE"
+    printf 'deadline=%s\n' "$deadline"
+    printf 'boot_id=%s\n' "$(dm_boot_id)"
+    printf 'probe=%s\n' "$probe"
+    printf 'uid=%s\n' "$(id -u)"
+    printf 'dry_run=%s\n' "$(dm_is_dry_run && echo 1 || echo 0)"
+    printf 'runner=%s\n' "${DEADMAN_RUNNER:-sudo -n}"
+    printf 'hooks_dir=%s\n' "$DEADMAN_HOOKS_DIR"
+    printf 'state_dir=%s\n' "$(dm_state_dir)"
+    printf 'hooks_requested=%s\n' "${DM_HOOK_PATHS[*]##*/}"
+  } >"$file"
+
+  dm_log "arm: id=$id hooks=${DM_HOOK_PATHS[*]##*/} ttl=${ttl}s deadline=$(iso_of "$deadline")"
+  dm_log "arm: probe=$probe dry_run=$(dm_is_dry_run && echo yes || echo no)"
+  if [[ $probe == none ]]; then
+    dm_log "arm: no session probe, only the TTL can fire this rollback (--grace is unused)"
+  fi
+
+  # Between the state file and the last snapshot there is an armed session with
+  # nothing watching it, and a Ctrl-C in that window would leave it that way.
+  # Same handling as a failed snapshot: restore what was captured, run nothing.
+  trap 'dm_log "arm: interrupted while capturing, aborting"; abort_failed_arm "$id" interrupted' INT TERM
+
+  for hook in "${DM_HOOK_PATHS[@]}"; do
+    name=$(basename "$hook")
+    rc=0
+    run_hook save "$hook" "$snapshots/$name" || rc=$?
+    case $rc in
+    0) DM_SAVED_HOOKS+=("$name") ;;
+    "$DM_EX_SKIP") ;;
+    *)
+      trap - INT TERM
+      dm_log "arm: snapshot failed in $name, aborting before any change is made"
+      abort_failed_arm "$id" "$name"
+      return 1
+      ;;
+    esac
+  done
+  trap - INT TERM
+  dm_state_set "$file" hooks_saved "${DM_SAVED_HOOKS[*]-}"
+
+  start_watchdog "$id"
+
+  if ((${#DM_PAYLOAD[@]} == 0)); then
+    dm_log "arm: armed. Make the change in this shell now."
+  else
+    rc=0
+    run_payload || rc=$?
+    if ((rc != 0)); then
+      dm_log "arm: the change itself exited $rc, rolling back at once"
+      stop_watchdog "$id"
+      do_rollback "$id" 'payload-failed' || true
+      return 1
+    fi
+  fi
+
+  dm_log "arm: run: deadman-ssh confirm   (once you can reach the box and the change holds)"
+  dm_log "arm: watchdog log: $session/log, snapshots: $snapshots"
+  return 0
+}
+
+# A failed snapshot means the switch cannot promise a restore, so it must not
+# pretend to be armed and must not run the change. The hooks that did capture
+# get restored anyway: they are the ones with something to put back.
+abort_failed_arm() {
+  local id="$1" failed="$2" file
+  file=$(dm_state_file "$id")
+  stop_watchdog "$id"
+  dm_state_set "$file" hooks_saved "${DM_SAVED_HOOKS[*]-}"
+  dm_state_set "$file" failed_hook "$failed"
+  if ((${#DM_SAVED_HOOKS[@]} > 0)); then
+    do_rollback "$id" 'snapshot-failed' || true
+  else
+    dm_state_set "$file" state 'aborted'
+    dm_log "arm: nothing had been captured yet, no restore needed"
+  fi
+}
+
+# An existing session is either live (refuse), finished (--force to replace) or
+# abandoned (point at recover, which is the only path allowed to act on it).
+guard_existing_session() {
+  local id="$1" file state pid
+  file=$(dm_state_file "$id")
+  [[ -f $file ]] || return 0
+  state=$(dm_state_get "$file" state 2>/dev/null) || state='unknown'
+  if [[ $state != armed ]]; then
+    if ((DM_FORCE)); then
+      dm_log "arm: --force, replacing finished session ($state)"
+      rm -rf "$(dm_session_dir "$id")"
+      return 0
+    fi
+    printf 'deadman: session %s exists in state %s. Re-arm with --force.\n' "$id" "$state" >&2
+    return 3
+  fi
+  pid=$(session_pid_of "$id")
+  if dm_pid_alive "$pid"; then
+    printf 'deadman: session %s is already armed (watchdog %s, deadline %s).\n' \
+      "$id" "$pid" "$(iso_of "$(dm_state_get "$file" deadline)")" >&2
+    printf 'deadman: confirm it, or arm under a different --id.\n' >&2
+    return 3
+  fi
+  printf 'deadman: session %s is armed but its watchdog (%s) is gone.\n' "$id" "${pid:-none}" >&2
+  printf 'deadman: run deadman-ssh recover first; arming over it would orphan a snapshot.\n' >&2
+  return 3
+}
+
+run_payload() {
+  ((${#DM_PAYLOAD[@]} > 0)) || return 0
+  if dm_is_dry_run; then
+    dm_log "DRY-RUN payload $(dm_quote "${DM_PAYLOAD[@]}")"
+    return 0
+  fi
+  dm_log "payload: $(dm_quote "${DM_PAYLOAD[@]}")"
+  "${DM_PAYLOAD[@]}"
+}
+
+cmd_watch() {
+  local id="$1" file dir state now deadline interval grace lost_at effective
+  local warned_lost=0 rc=0
+  file=$(dm_state_file "$id")
+  dir=$(dm_session_dir "$id")
+  [[ -f $file ]] || die_usage "no session '$id' in $(dm_state_dir)"
+  session_export_env "$file"
+  printf '%s\n' "$$" >"$dir/watchpid"
+  # Re-read with validation rather than trusting the file: a watchdog that
+  # slept "" or compared against an empty deadline would die, and a dead
+  # watchdog is the failure this whole tool exists to prevent.
+  interval=$(dm_state_get "$file" interval 2>/dev/null || true)
+  [[ $interval =~ ^[1-9][0-9]*$ ]] || interval=2
+  grace=$(dm_state_get "$file" grace 2>/dev/null || true)
+  [[ $grace =~ ^[0-9]+$ ]] || grace=10
+  dm_log "watch: pid $$ watching $id, interval ${interval}s, grace ${grace}s"
+  while :; do
+    state=$(dm_state_get "$file" state 2>/dev/null) || state='unknown'
+    if [[ $state != armed ]]; then
+      dm_log "watch: state is $state, standing down"
+      return 0
+    fi
+    if [[ -e $dir/CONFIRMED ]]; then
+      dm_log "watch: confirmed ($(cat "$dir/CONFIRMED")), disarming"
+      dm_state_set "$file" state 'confirmed'
+      dm_state_set "$file" confirmed_at "$(dm_now_iso)"
+      return 0
+    fi
+    if [[ -e $dir/ROLLED_BACK ]]; then
+      dm_log "watch: rollback already recorded by another process, standing down"
+      return 0
+    fi
+    now=$(dm_now)
+    deadline=$(dm_state_get "$file" deadline 2>/dev/null || true)
+    # A deadline that cannot be read counts as passed. The watchdog failing to
+    # act is the worse error, for the same reason recover_session says so.
+    [[ $deadline =~ ^[0-9]+$ ]] || deadline=0
+    if ! session_is_live "$file"; then
+      if ((warned_lost == 0)); then
+        dm_log "watch: session is gone, ${grace}s of grace from $(iso_of "$now")"
+        dm_state_set "$file" session_lost_at "$now"
+        warned_lost=1
+      fi
+      lost_at=$(dm_state_get "$file" session_lost_at)
+      effective=$((lost_at + grace))
+      ((effective < deadline)) && deadline=$effective
+    fi
+    if ((now >= deadline)); then
+      dm_log "watch: deadline $(iso_of "$deadline") reached"
+      do_rollback "$id" 'expired' || rc=$?
+      return "$rc"
+    fi
+    sleep "$interval"
+  done
+}
+
+require_armed() {
+  local id="$1" file state
+  file=$(dm_state_file "$id")
+  [[ -f $file ]] || die_usage "no session '$id' in $(dm_state_dir)"
+  session_export_env "$file"
+  state=$(dm_state_get "$file" state)
+  if [[ $state != armed ]]; then
+    printf 'deadman: session %s is %s, this command needs it armed.\n' "$id" "$state" >&2
+    return 3
+  fi
+  printf '%s\n' "$state"
+}
+
+cmd_confirm() {
+  local id="$1" dir
+  require_armed "$id" >/dev/null || return $?
+  dir=$(dm_session_dir "$id")
+  printf '%s by uid %s\n' "$(dm_now_iso)" "$(id -un)" >"$dir/CONFIRMED"
+  dm_log "confirm: marker written, the watchdog stands down within ${DM_INTERVAL}s"
+  dm_log "confirm: the change stays. Snapshots kept until you pass --purge to disarm."
+}
+
+cmd_extend() {
+  local id="$1" file new ttl
+  require_armed "$id" >/dev/null || return $?
+  file=$(dm_state_file "$id")
+  ttl=$(dm_parse_ttl "$DM_TTL")
+  new=$(( $(dm_now) + ttl ))
+  dm_state_set "$file" deadline "$new"
+  dm_log "extend: deadline moved to $(iso_of "$new") (+${ttl}s from now)"
+}
+
+print_status() {
+  local id="$1" file dir state deadline pid probe live secs_left
+  file=$(dm_state_file "$id")
+  dir=$(dm_session_dir "$id")
+  [[ -f $file ]] || die_usage "no session '$id' in $(dm_state_dir)"
+  session_export_env "$file"
+  state=$(dm_state_get "$file" state)
+  deadline=$(dm_state_get "$file" deadline 2>/dev/null || true)
+  pid=$(session_pid_of "$id")
+  probe=$(dm_state_get "$file" probe 2>/dev/null || true)
+  live=''
+  if [[ $state == armed ]]; then
+    if dm_pid_alive "$pid"; then
+      live="watchdog=$pid"
+    else
+      live="WATCHDOG=${pid:-none}-GONE"
+    fi
+  fi
+  secs_left='-'
+  if [[ -n $deadline && $deadline =~ ^[0-9]+$ ]]; then
+    secs_left=$((deadline - $(dm_now)))
+    ((secs_left < 0)) && secs_left=0
+  fi
+  printf 'id=%s state=%s deadline=%s left=%ss %s probe=%s dry_run=%s\n' \
+    "$id" "$state" "$(iso_of "$deadline")" "$secs_left" "$live" "$probe" \
+    "$(dm_state_get "$file" dry_run)"
+  printf '  hooks: saved=[%s] requested=[%s]\n' \
+    "$(dm_state_get "$file" hooks_saved 2>/dev/null || true)" \
+    "$(dm_state_get "$file" hooks_requested 2>/dev/null || true)"
+  printf '  armed in boot %s, this boot %s\n' \
+    "$(dm_state_get "$file" boot_id 2>/dev/null || true)" "$(dm_boot_id)"
+  printf '  dir: %s\n' "$dir"
+  if [[ -e $dir/CONFIRMED ]]; then
+    printf '  confirmed: %s\n' "$(cat "$dir/CONFIRMED")"
+  fi
+  if [[ -e $dir/ROLLED_BACK ]]; then
+    printf '  rolled back: %s\n' "$(cat "$dir/ROLLED_BACK")"
+  fi
+  return 0
+}
+
+cmd_status() {
+  local id="$1" root entry found=0
+  # A named session that does not exist is an operand error, not an empty list:
+  # a typo in --id must not read as "nothing is armed".
+  if [[ -n $id ]]; then
+    print_status "$id"
+    return 0
+  fi
+  root=$(dm_state_dir)/sessions
+  shopt -s nullglob
+  for entry in "$root"/*; do
+    [[ -d $entry && -f $entry/state ]] || continue
+    print_status "$(basename "$entry")"
+    found=1
+  done
+  shopt -u nullglob
+  if ((found == 0)); then
+    printf 'no sessions under %s\n' "$root"
+  fi
+  return 0
+}
+
+cmd_disarm() {
+  local id="$1" file
+  file=$(dm_state_file "$id")
+  [[ -f $file ]] || die_usage "no session '$id' in $(dm_state_dir)"
+  session_export_env "$file"
+  stop_watchdog "$id"
+  dm_state_set "$file" state 'disarmed'
+  dm_state_set "$file" disarmed_at "$(dm_now_iso)"
+  dm_log "disarm: $id will not roll back; snapshots in $(dm_session_dir "$id")/snapshots"
+  if ((DM_PURGE)); then
+    rm -rf "$(dm_session_dir "$id")"
+    dm_log "disarm: --purge removed the session directory"
+  fi
+}
+
+cmd_rollback() {
+  local id="$1" file
+  file=$(dm_state_file "$id")
+  [[ -f $file ]] || die_usage "no session '$id' in $(dm_state_dir)"
+  session_export_env "$file"
+  stop_watchdog "$id"
+  do_rollback "$id" "$DM_REASON"
+}
+
+# An armed session with a dead watchdog is the interesting failure. It means
+# the machine rebooted, the process was killed, or a rollback died halfway.
+# Decide from what is on disk, never from memory, and never twice.
+cmd_recover() {
+  local want="$1" root entry id acted=0
+  root=$(dm_state_dir)/sessions
+  shopt -s nullglob
+  for entry in "$root"/*; do
+    [[ -d $entry && -f $entry/state ]] || continue
+    id=$(basename "$entry")
+    if [[ -n $want && $want != "$id" ]]; then
+      continue
+    fi
+    recover_session "$id" && acted=1
+  done
+  shopt -u nullglob
+  if [[ -n $want && $acted == 0 ]]; then
+    die_usage "no session '$want' in $root"
+  fi
+  if ((acted == 0)); then
+    dm_log "recover: nothing pending"
+  fi
+  return 0
+}
+
+# 0 when this session was unattended and has now been dealt with, 1 when there
+# was nothing to deal with.
+recover_session() {
+  local id="$1" file state pid armed_boot now_boot deadline
+  file=$(dm_state_file "$id")
+  session_export_env "$file"
+  state=$(dm_state_get "$file" state 2>/dev/null) || state='unknown'
+  case $state in
+  armed | rollback-failed) ;;
+  *) return 1 ;;
+  esac
+  pid=$(session_pid_of "$id")
+  if dm_pid_alive "$pid"; then
+    return 1
+  fi
+  armed_boot=$(dm_state_get "$file" boot_id)
+  now_boot=$(dm_boot_id)
+  if [[ $armed_boot != "$now_boot" ]]; then
+    dm_log "recover: $id was armed in boot $armed_boot and this host booted as $now_boot"
+    dm_log "recover: the change was never confirmed and no watchdog survived the reboot"
+    dm_state_set "$file" reboot_detected "$(dm_now_iso)"
+    do_rollback "$id" 'after-reboot' || true
+    return 0
+  fi
+  if [[ $state == 'rollback-failed' ]]; then
+    dm_log "recover: $id stopped mid-rollback, retrying every captured hook"
+    do_rollback "$id" 'retry' || true
+    return 0
+  fi
+  deadline=$(dm_state_get "$file" deadline 2>/dev/null || true)
+  # No readable deadline on an unconfirmed session means the countdown cannot be
+  # honoured, and the promise of the switch is the rollback, not the wait.
+  [[ $deadline =~ ^[0-9]+$ ]] || deadline=0
+  if (( $(dm_now) >= deadline )); then
+    dm_log "recover: $id expired with nothing watching it"
+    do_rollback "$id" 'expired-unwatched' || true
+    return 0
+  fi
+  dm_log "recover: $id has $((deadline - $(dm_now)))s left and no watchdog, starting a new one"
+  start_watchdog "$id"
+  return 0
+}
+
+cmd_hooks() {
+  local name path opts
+  printf 'hook directory: %s\n' "$DEADMAN_HOOKS_DIR"
+  while IFS= read -r name; do
+    [[ -z $name ]] && continue
+    path="$DEADMAN_HOOKS_DIR/$name"
+    opts=$(sed -n 's/^# hook-opt \([A-Za-z0-9_]\+\).*/\1/p' "$path" | paste -sd, -)
+    printf '%-16s opts: %s\n' "$name" "${opts:-none}"
+  done < <(available_hooks)
+  return 0
+}
+
+# --- argument parsing --------------------------------------------------
+
+COMMAND=''
+parse_args() {
+  local operand='' secs
+  while (($#)); do
+    case $1 in
+    --ttl | --interval | --grace | --id | --hook | --opt | --reason)
+      [[ $# -ge 2 ]] || die_usage "$1 needs a value"
+      local key=${1#--}
+      key=${key//-/_}
+      case $key in
+      id) DM_ID=$2 ;;
+      hook) add_hook_name "$2" ;;
+      # The numeric options are refused here rather than in the command, so
+      # "--ttl arm" is a usage error instead of a swallowed command word.
+      ttl)
+        secs=$(dm_parse_ttl "$2" 2>/dev/null) ||
+          die_usage "--ttl must be plain seconds or s/m/h/d, got '$2'"
+        ((secs > 0)) || die_usage "--ttl must be greater than zero, got '$2'"
+        DM_TTL=$2
+        ;;
+      interval)
+        [[ $2 =~ ^[1-9][0-9]*$ ]] || die_usage "--interval must be a positive integer, got '$2'"
+        DM_INTERVAL=$2
+        ;;
+      grace)
+        [[ $2 =~ ^[0-9]+$ ]] || die_usage "--grace must be a non-negative integer, got '$2'"
+        DM_GRACE=$2
+        ;;
+      opt)
+        [[ $2 == *=* ]] || die_usage "--opt wants KEY=VALUE, got '$2'"
+        DM_OPTS+=("$2")
+        ;;
+      *) printf -v "DM_${key^^}" '%s' "$2" ;;
+      esac
+      shift 2
+      ;;
+    --force)
+      DM_FORCE=1
+      shift
+      ;;
+    --purge)
+      DM_PURGE=1
+      shift
+      ;;
+    --help | -h)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      DM_PAYLOAD=("$@")
+      break
+      ;;
+    -*) die_usage "unknown option '$1'" ;;
+    *)
+      if [[ -n $COMMAND ]]; then
+        # Everything after the command is either the session operand or the
+        # payload. arm has no operand and its payload needs --, so a bare word
+        # there is always a mistake worth naming.
+        [[ $COMMAND == arm ]] &&
+          die_usage "'$1' looks like the start of a payload; arm wants '-- $1'"
+        [[ -z $operand ]] || die_usage "command '$COMMAND' takes one id, got '$operand' and '$1'"
+        operand=$1
+        shift
+      else
+        COMMAND=$1
+        shift
+      fi
+      ;;
+    esac
+  done
+  [[ -n $COMMAND ]] || COMMAND=help
+  if [[ -n $operand && -z $DM_ID ]]; then
+    DM_ID=$operand
+  fi
+  if [[ -n $DM_ID ]]; then
+    validate_id "$DM_ID"
+  fi
+}
+
+# The id is a directory name under the state root, so it gets checked at the
+# edge instead of being filtered everywhere it is used.
+validate_id() {
+  case $1 in
+  */* | .* | *' '*) die_usage "session id '$1' must not contain a slash, a leading dot or a space" ;;
+  esac
+  return 0
+}
+
+target_id_or_empty() {
+  printf '%s\n' "${DM_ID:-}"
+}
+
+main() {
+  parse_args "$@"
+  case $COMMAND in
+  arm)
+    cmd_arm
+    ;;
+  watch)
+    local_id=${DM_ID:-$(default_id)}
+    cmd_watch "$local_id"
+    ;;
+  confirm | extend | rollback | disarm)
+    id=${DM_ID:-$(default_id)}
+    case $COMMAND in
+    confirm) cmd_confirm "$id" ;;
+    extend) cmd_extend "$id" ;;
+    rollback) cmd_rollback "$id" ;;
+    disarm) cmd_disarm "$id" ;;
+    esac
+    ;;
+  status)
+    cmd_status "$(target_id_or_empty)"
+    ;;
+  recover)
+    cmd_recover "$(target_id_or_empty)"
+    ;;
+  hooks)
+    cmd_hooks
+    ;;
+  version)
+    printf 'deadman-ssh 1.0.0\n'
+    ;;
+  help)
+    usage
+    ;;
+  *)
+    printf 'deadman: unknown command %s\n' "$COMMAND" >&2
+    usage >&2
+    exit 2
+    ;;
+  esac
+}
+
+main "$@"
