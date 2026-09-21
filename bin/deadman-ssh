@@ -45,6 +45,7 @@ Usage:
   deadman-ssh rollback   [id] [--reason TEXT]
   deadman-ssh recover    [id]
   deadman-ssh hooks
+  deadman-ssh version
   deadman-ssh help
 
 Except for arm, one operand after the command names the session; --id wins if
@@ -156,7 +157,7 @@ add_hook_name() {
 }
 
 resolve_hooks() {
-  local name path
+  local name path seen=' '
   DM_HOOK_PATHS=()
   if ((${#DM_HOOK_NAMES[@]} == 0)); then
     while IFS= read -r name; do
@@ -165,6 +166,10 @@ resolve_hooks() {
     return 0
   fi
   for name in "${DM_HOOK_NAMES[@]}"; do
+    # A repeated --hook would capture twice into the same directory and then
+    # restore the same hook twice, so the second mention is the same request.
+    [[ $seen == *" $name "* ]] && continue
+    seen+="$name "
     path="$DEADMAN_HOOKS_DIR/$name"
     [[ -f $path && -x $path ]] ||
       die_usage "no executable hook named '$name' in $DEADMAN_HOOKS_DIR"
@@ -203,6 +208,10 @@ export_opts() {
 #
 # pick_probe records the tuple while the session is definitely up, so a probe
 # that cannot be verified right now is dropped rather than trusted.
+#
+# The IPv4-only pattern is deliberate: SSH_CONNECTION quotes IPv6 peers as
+# `[2001:db8::1]`, which never equals the form ss prints in its address columns,
+# and a tuple that cannot be compared is a probe that must not be trusted.
 pick_probe() {
   local client_ip client_port server_ip server_port
   if [[ -n ${SSH_CONNECTION:-} ]]; then
@@ -242,8 +251,11 @@ socket_state() {
     printf 'unknown\n'
     return 0
   fi
+  # The two endpoints are adjacent wherever they land: iproute2 drops the State
+  # column when a state filter is given and older builds keep it, so a fixed
+  # field number is a probe that silently reads "gone" on the wrong release.
   if awk -v l="$local_ep" -v p="$peer_ep" '
-    $3 == l && $4 == p { found = 1 }
+    { for (i = 1; i < NF; i++) if ($i == l && $(i + 1) == p) found = 1 }
     END { exit !found }
   ' <<<"$out"; then
     printf 'present\n'
@@ -254,19 +266,21 @@ socket_state() {
 }
 
 # Reads `probe` back from the state file. Always conservative: a probe that
-# cannot answer reports the session as alive, and the TTL is what decides.
+# cannot answer, including one whose tuple is too short to ask with, reports the
+# session as alive, and the TTL is what decides.
 session_is_live() {
-  local file="$1" probe
+  local file="$1" probe state
   local -a args
   probe=$(dm_state_get "$file" probe 2>/dev/null) || probe='none'
   read -r -a args <<<"$probe"
-  case ${args[0]} in
+  case ${args[0]:-none} in
   pid)
-    dm_pid_alive "${args[1]:-}"
+    [[ ${#args[@]} == 2 ]] || return 0
+    dm_pid_alive "${args[1]}"
     ;;
   socket)
-    local state
-    state=$(socket_state "${args[1]:-}" "${args[2]:-}")
+    [[ ${#args[@]} == 3 ]] || return 0
+    state=$(socket_state "${args[1]}" "${args[2]}")
     [[ $state != gone ]]
     ;;
   *)
@@ -312,10 +326,21 @@ do_rollback() {
   return 1
 }
 
+# A stale pid file can name a process that is not ours any more, after a reboot
+# or a recycled pid, so the command line is checked before anything is signalled.
+# Read into a variable rather than piped into grep: grep -q exits on the match
+# and can leave tr holding a SIGPIPE, which pipefail would report as no match.
+watchdog_matches() {
+  local pid="$1" cmd
+  [[ -n $pid && -r /proc/$pid/cmdline ]] || return 1
+  cmd=$(tr '\0' ' ' <"/proc/$pid/cmdline")
+  [[ $cmd == *'deadman-ssh watch'* ]]
+}
+
 stop_watchdog() {
   local id="$1" pid
   pid=$(session_pid_of "$id")
-  if dm_pid_alive "$pid"; then
+  if dm_pid_alive "$pid" && watchdog_matches "$pid"; then
     kill "$pid" 2>/dev/null || true
     dm_log "watchdog $pid stopped"
   fi
@@ -390,7 +415,7 @@ cmd_arm() {
   # Between the state file and the last snapshot there is an armed session with
   # nothing watching it, and a Ctrl-C in that window would leave it that way.
   # Same handling as a failed snapshot: restore what was captured, run nothing.
-  trap 'dm_log "arm: interrupted while capturing, aborting"; abort_failed_arm "$id" interrupted' INT TERM
+  trap 'dm_log "arm: interrupted while capturing, aborting"; abort_failed_arm "$id" interrupted; exit 1' INT TERM
 
   for hook in "${DM_HOOK_PATHS[@]}"; do
     name=$(basename "$hook")
@@ -555,11 +580,14 @@ require_armed() {
 }
 
 cmd_confirm() {
-  local id="$1" dir
+  local id="$1" dir interval
   require_armed "$id" >/dev/null || return $?
   dir=$(dm_session_dir "$id")
+  # The interval the watchdog actually sleeps on is the one recorded at arm
+  # time, not the default of whoever types confirm.
+  interval=$(dm_state_get "$(dm_state_file "$id")" interval 2>/dev/null) || interval=$DM_INTERVAL
   printf '%s by uid %s\n' "$(dm_now_iso)" "$(id -un)" >"$dir/CONFIRMED"
-  dm_log "confirm: marker written, the watchdog stands down within ${DM_INTERVAL}s"
+  dm_log "confirm: marker written, the watchdog stands down within ${interval}s"
   dm_log "confirm: the change stays. Snapshots kept until you pass --purge to disarm."
 }
 
@@ -666,6 +694,11 @@ cmd_rollback() {
 cmd_recover() {
   local want="$1" root entry id acted=0
   root=$(dm_state_dir)/sessions
+  # A named session that is not there is an operand error; one that exists and
+  # needs nothing is a no-op.
+  if [[ -n $want && ! -f $(dm_state_file "$want") ]]; then
+    die_usage "no session '$want' in $root"
+  fi
   shopt -s nullglob
   for entry in "$root"/*; do
     [[ -d $entry && -f $entry/state ]] || continue
@@ -676,9 +709,6 @@ cmd_recover() {
     recover_session "$id" && acted=1
   done
   shopt -u nullglob
-  if [[ -n $want && $acted == 0 ]]; then
-    die_usage "no session '$want' in $root"
-  fi
   if ((acted == 0)); then
     dm_log "recover: nothing pending"
   fi
@@ -750,9 +780,9 @@ parse_args() {
     --ttl | --interval | --grace | --id | --hook | --opt | --reason)
       [[ $# -ge 2 ]] || die_usage "$1 needs a value"
       local key=${1#--}
-      key=${key//-/_}
       case $key in
       id) DM_ID=$2 ;;
+      reason) DM_REASON=$2 ;;
       hook) add_hook_name "$2" ;;
       # The numeric options are refused here rather than in the command, so
       # "--ttl arm" is a usage error instead of a swallowed command word.
@@ -774,7 +804,6 @@ parse_args() {
         [[ $2 == *=* ]] || die_usage "--opt wants KEY=VALUE, got '$2'"
         DM_OPTS+=("$2")
         ;;
-      *) printf -v "DM_${key^^}" '%s' "$2" ;;
       esac
       shift 2
       ;;
@@ -836,18 +865,18 @@ target_id_or_empty() {
 }
 
 main() {
+  local id
   parse_args "$@"
   case $COMMAND in
   arm)
     cmd_arm
     ;;
-  watch)
-    local_id=${DM_ID:-$(default_id)}
-    cmd_watch "$local_id"
-    ;;
-  confirm | extend | rollback | disarm)
+  watch | confirm | extend | rollback | disarm)
+    # Every command that acts on one session resolves it the same way: an
+    # explicit operand or --id, else the default this host would have armed.
     id=${DM_ID:-$(default_id)}
     case $COMMAND in
+    watch) cmd_watch "$id" ;;
     confirm) cmd_confirm "$id" ;;
     extend) cmd_extend "$id" ;;
     rollback) cmd_rollback "$id" ;;
