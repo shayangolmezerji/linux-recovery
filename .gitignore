@@ -1,0 +1,7 @@
+# Local dry-run experiments keep their state here instead of in ~/.local/state.
+.deadman-state/
+
+# Editor and patch leftovers.
+*.swp
+*.orig
+*.rej
