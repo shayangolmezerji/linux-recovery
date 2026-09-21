@@ -29,15 +29,21 @@ save)
   dm_capture "$snap/ruleset.nft" nft list ruleset
   ;;
 restore)
-  if [[ ! -s $snap/ruleset.nft ]]; then
-    dm_die "restore asked for $snap/ruleset.nft and it is empty"
+  # No snapshot file means this hook never captured anything, so there is
+  # nothing to go back to and the live ruleset is not ours to touch.
+  if [[ ! -f $snap/ruleset.nft ]]; then
+    dm_die "no snapshot at $snap/ruleset.nft: refusing to touch the live ruleset"
   fi
   # `nft -f` merges instead of replacing, so the rules the risky change added
   # would survive a reload. Flushing first is the difference between a rollback
   # and a reconciliation. Atomic ruleset namespace swap is cleaner still, but it
   # only helps for tables the operator owns, not for the system ruleset.
   dm_priv nft flush ruleset
-  dm_priv nft -f "$snap/ruleset.nft"
+  # An empty capture is a real state: a host with no rules to begin with, which
+  # the risky change filled in. Reloading nothing is the whole rollback there.
+  if [[ -s $snap/ruleset.nft ]]; then
+    dm_priv nft -f "$snap/ruleset.nft"
+  fi
   ;;
 *)
   dm_die "unknown action '$action'"
