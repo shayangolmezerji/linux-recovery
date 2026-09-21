@@ -602,7 +602,7 @@ cmd_extend() {
 }
 
 print_status() {
-  local id="$1" file dir state deadline pid probe live secs_left
+  local id="$1" file dir state deadline pid probe live secs_left left
   file=$(dm_state_file "$id")
   dir=$(dm_session_dir "$id")
   [[ -f $file ]] || die_usage "no session '$id' in $(dm_state_dir)"
@@ -619,13 +619,14 @@ print_status() {
       live="WATCHDOG=${pid:-none}-GONE"
     fi
   fi
-  secs_left='-'
+  left='-'
   if [[ -n $deadline && $deadline =~ ^[0-9]+$ ]]; then
     secs_left=$((deadline - $(dm_now)))
     ((secs_left < 0)) && secs_left=0
+    left=$(dm_duration "$secs_left")
   fi
-  printf 'id=%s state=%s deadline=%s left=%ss %s probe=%s dry_run=%s\n' \
-    "$id" "$state" "$(iso_of "$deadline")" "$secs_left" "$live" "$probe" \
+  printf 'id=%s state=%s deadline=%s left=%s %s probe=%s dry_run=%s\n' \
+    "$id" "$state" "$(iso_of "$deadline")" "$left" "$live" "$probe" \
     "$(dm_state_get "$file" dry_run)"
   printf '  hooks: saved=[%s] requested=[%s]\n' \
     "$(dm_state_get "$file" hooks_saved 2>/dev/null || true)" \
@@ -753,7 +754,7 @@ recover_session() {
     do_rollback "$id" 'expired-unwatched' || true
     return 0
   fi
-  dm_log "recover: $id has $((deadline - $(dm_now)))s left and no watchdog, starting a new one"
+  dm_log "recover: $id has $(dm_duration "$((deadline - $(dm_now)))") and no watchdog, starting a new one"
   start_watchdog "$id"
   return 0
 }

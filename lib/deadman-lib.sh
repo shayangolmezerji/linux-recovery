@@ -109,7 +109,7 @@ dm_require_cmd() {
   local cmd
   for cmd in "$@"; do
     command -v "$cmd" >/dev/null 2>&1 || {
-      dm_log "SKIP $1: not installed"
+      dm_log "SKIP $cmd: not installed"
       exit "$DM_EX_SKIP"
     }
   done
@@ -180,7 +180,8 @@ dm_parse_ttl() {
   esac
 }
 
-# Formats a countdown for `status`. Negative means overdue.
+# The one place a countdown is rendered for a person to read, so `status` and
+# `recover` cannot drift apart. Negative means overdue.
 dm_duration() {
   local seconds="$1" sign='' abs
   if ((seconds < 0)); then
