@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+# Test fixture hook that fails during save, which has to abort the arm before
+# the risky change is attempted.
+set -euo pipefail
+
+name=90-failsave
+action=${1:-}
+snap=${2:-}
+printf '%s %s\n' "$action" "$name" >>"${DM_TEST_TRACE:?harness must set DM_TEST_TRACE}"
+
+if [[ $action == save ]]; then
+  printf '90-failsave: cannot read the thing I was asked to capture\n' >&2
+  exit 1
+fi
+
+printf 'failsave restored\n' >"$snap/note"

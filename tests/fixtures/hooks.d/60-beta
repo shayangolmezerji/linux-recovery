@@ -1,0 +1,17 @@
+#!/usr/bin/env bash
+# Test fixture hook, second in numeric order so restore order is observable.
+set -euo pipefail
+
+name=60-beta
+action=${1:-}
+snap=${2:-}
+printf '%s %s\n' "$action" "$name" >>"${DM_TEST_TRACE:?harness must set DM_TEST_TRACE}"
+
+case $action in
+save) printf 'beta state\n' >"$snap/note" ;;
+restore)
+  [[ -s $snap/note ]] || { printf 'beta: no snapshot\n' >&2; exit 1; }
+  printf 'beta restored %s\n' "$(cat "$snap/note")"
+  ;;
+*) exit 64 ;;
+esac

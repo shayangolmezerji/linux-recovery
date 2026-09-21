@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Test fixture hook for the "not applicable on this host" path: exit 77 means
+# the switch records a skip and must not call restore for it later.
+set -euo pipefail
+
+name=77-notapplicable
+action=${1:-}
+printf '%s %s\n' "$action" "$name" >>"${DM_TEST_TRACE:?harness must set DM_TEST_TRACE}"
+printf 'SKIP %s: this host has nothing for me to capture\n' "$name"
+exit 77

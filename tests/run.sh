@@ -5,10 +5,16 @@
 #
 # Everything runs with DEADMAN_DRY_RUN=1 against a scratch state directory under
 # $TMPDIR, so the suite observes the arm -> expire -> rollback sequence without
-# touching a single system file. The two tests that turn dry-run off use fixture
-# hooks that only write inside the scratch directory, plus a payload of `false`.
-# Nothing here calls nft, ip, iptables, tc or systemctl, and the only processes
-# ever signalled are watchdogs this harness started itself.
+# touching a single system file. Three tests turn dry-run off, because dry-run is
+# what would hide the answer there: a payload that fails, a snapshot that fails,
+# a capture that is interrupted. They use fixture hooks that only write inside
+# the scratch directory, and payloads of `false` or `touch`. Nothing here calls
+# nft, ip, iptables, tc or systemctl, and DEADMAN_RUNNER is pinned to `false` so
+# that a stray privileged call fails instead of escalating. The socket probe
+# tests run against a fake `ss` this harness puts on PATH; the one test that asks
+# the host's own ss only ever lists it, and passes whichever way that goes. The
+# only processes ever signalled are the watchdogs and the single arm that this
+# harness started itself, and each pid is checked against /proc first.
 #
 # bats is not a dependency, so the runner is hand-rolled: a test is a function
 # named test_*, and every check is one of the expect_* calls below.
@@ -18,11 +24,13 @@ TESTS_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 ROOT=$(cd -- "$TESTS_DIR/.." && pwd)
 DM="$ROOT/bin/deadman-ssh"
 FIXTURE_HOOKS="$TESTS_DIR/fixtures/hooks.d"
+FIXTURE_BIN="$TESTS_DIR/fixtures/bin"
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/deadman-tests.XXXXXX")
 STATE=$WORK/state
 TRACE=$WORK/trace
 BOOTID=$WORK/boot_id
+SSTABLE=$WORK/ss-table
 
 pass=0
 fail=0
@@ -53,7 +61,15 @@ export DEADMAN_STATE_DIR="$STATE"
 export DEADMAN_HOOKS_DIR="$FIXTURE_HOOKS"
 export DM_TEST_TRACE="$TRACE"
 export DEADMAN_BOOT_ID_FILE="$BOOTID"
+# The escalator is fake for the whole suite. No test is supposed to reach it, and
+# a run that does must fail rather than hand this host a real `sudo -n`.
+export DEADMAN_RUNNER='false'
 printf 'boot-under-test\n' >"$BOOTID"
+# The fake `ss` in fixtures/bin prints whatever is in this file, so the socket
+# probe can be shown both iproute2 column layouts, and made to lose the session
+# halfway through a run, without a live SSH connection anywhere near it.
+export DM_FAKE_SS_TABLE="$SSTABLE"
+: >"$SSTABLE"
 
 note() { printf '%s\n' "$*"; }
 
@@ -81,6 +97,16 @@ run() {
   OUT=$("$DM" "$@" 2>&1) || RC=$?
 }
 
+# The session every socket test pretends to be. 192.0.2.0/24 is documentation
+# space, so no peer of this host can ever match it, and SS_ROWS holds the two
+# column layouts iproute2 has been seen to print for `ss -Htn state established`:
+# with and without the leading State column.
+SS_TUPLE='192.0.2.1 45455 192.0.2.2 22'
+SS_ROWS=(
+  '0 0 192.0.2.2:22 192.0.2.1:45455'
+  'ESTAB 0 0 192.0.2.2:22 192.0.2.1:45455'
+)
+
 # One variable overridden for a single call, used to point the hook directory at
 # the shipped hooks.d and to fake a session pid.
 run_with_env() {
@@ -96,6 +122,13 @@ run_with_env() {
 run_real() {
   RC=0
   OUT=$(env -u DEADMAN_DRY_RUN "$DM" "$@" 2>&1) || RC=$?
+}
+
+# Arms with SS_TUPLE, with the fake ss in fixtures/bin ahead of the host's own on
+# PATH. The watchdog inherits both, so a probe stays readable after the arm too.
+run_with_ss() {
+  RC=0
+  OUT=$(env "PATH=$FIXTURE_BIN:$PATH" "SSH_CONNECTION=$SS_TUPLE" "$DM" "$@" 2>&1) || RC=$?
 }
 
 expect_rc() {
@@ -114,6 +147,18 @@ expect_out() {
     ok "$name"
   else
     bad "$name: output did not contain: $needle"
+    printf '%s\n' "$OUT" | sed 's/^/       | /'
+  fi
+}
+
+# For output that is only partly predictable: a countdown depends on how long
+# the arm took, so the shape is asserted and the number is not.
+expect_out_matching() {
+  local regex=$1 name=$2
+  if [[ $OUT =~ $regex ]]; then
+    ok "$name (matched $regex)"
+  else
+    bad "$name: output did not match: $regex"
     printf '%s\n' "$OUT" | sed 's/^/       | /'
   fi
 }
@@ -170,6 +215,31 @@ expect_no_trace() {
 # Line number of the first match in the trace, for ordering assertions.
 trace_line() {
   grep -nF -- "$1" "$TRACE" | head -n1 | cut -d: -f1
+}
+
+# Counts a hook action in the trace. Absence assertions only prove the hook was
+# never called if a wrong count is also a failure, so the number is the check.
+expect_trace_count() {
+  local needle=$1 want=$2 name=$3 got
+  got=$(grep -cF -- "$needle" "$TRACE" 2>/dev/null) || got=0
+  if [[ $got == "$want" ]]; then
+    ok "$name"
+  else
+    bad "$name: trace has $got lines matching '$needle', want $want"
+    [[ -f $TRACE ]] && sed 's/^/       | /' "$TRACE"
+  fi
+}
+
+# For a snapshot file whose content is the point: a dry-run capture must hold a
+# placeholder, not the output of a command that never ran.
+expect_file_contains() {
+  local file=$1 needle=$2 name=$3
+  if [[ -f $file ]] && grep -qF -- "$needle" "$file"; then
+    ok "$name"
+  else
+    bad "$name: $file does not contain '$needle'"
+    [[ -f $file ]] && sed 's/^/       | /' "$file"
+  fi
 }
 
 # Same as expect_trace, for the per-session watchdog log written by deadman-ssh.
@@ -407,6 +477,10 @@ test_double_arm_is_refused() {
   run --id twin --ttl 300 --hook 50-alpha arm
   expect_rc 3 're-arming a finished session is still refused'
   expect_out 'exists in state disarmed' 'the refusal names the old state'
+  # armed_at has one-second resolution and the arms run faster than that, so
+  # without the pause a rewrite could land in the same second and read as a
+  # session that was never replaced.
+  sleep 1
   run --id twin --force --ttl 300 --hook 50-alpha arm
   expect_rc 0 '--force takes over a finished session'
   expect_out '--force, replacing finished session' 'the takeover is logged'
@@ -441,7 +515,9 @@ test_skipped_hook_is_not_restored() {
 test_failed_snapshot_aborts_before_the_change() {
   section 'a snapshot failure aborts the arm before any change is attempted'
   : >"$TRACE"
-  run --id badsnap --ttl 300 --hook 50-alpha --hook 90-failsave arm -- touch "$WORK/should-not-exist"
+  # Dry-run off: with it on, the payload is never executed whichever way this
+  # test goes, and "the payload never ran" would assert nothing.
+  run_real --id badsnap --ttl 300 --hook 50-alpha --hook 90-failsave arm -- touch "$WORK/should-not-exist"
   expect_rc 1 'arm exits 1'
   expect_out 'aborting before any change is made' 'the abort is explained'
   expect_no_file "$WORK/should-not-exist" 'the payload never ran'
@@ -452,23 +528,40 @@ test_failed_snapshot_aborts_before_the_change() {
 }
 
 test_interrupted_capture_rolls_back() {
-  section 'an interrupt while capturing aborts the arm and restores what was saved'
+  section 'a signal while capturing aborts the arm and restores what was saved'
   : >"$TRACE"
+  local arm_out=$WORK/interrupt.out arm_pid
   RC=0
-  OUT=$({
-    "$DM" --id interrupt --ttl 300 --hook 50-alpha --hook 80-slowsave arm -- touch "$WORK/also-not" &
+  # Two things have to go right for this to test anything. Dry-run is off, or the
+  # payload would never run and its absence would prove nothing. And job control
+  # is on: a background command of a non-interactive shell inherits SIGINT as
+  # ignored, bash refuses to trap a signal it was entered with ignored, and the
+  # kill below would be swallowed by the arm instead of reaching its trap.
+  set -m
+  {
+    env -u DEADMAN_DRY_RUN "$DM" --id interrupt --ttl 300 \
+      --hook 50-alpha --hook 80-slowsave arm -- touch "$WORK/also-not" >"$arm_out" 2>&1 &
     arm_pid=$!
     sleep 0.5
     kill -INT "$arm_pid" 2>/dev/null || true
-    wait "$arm_pid"
-  } 2>&1) || RC=$?
+    wait "$arm_pid" || RC=$?
+  }
+  set +m
+  OUT=$(<"$arm_out")
   expect_rc 1 'the interrupted arm exits 1'
   expect_out 'interrupted while capturing' 'the abort is logged'
   expect_no_file "$WORK/also-not" 'the payload never ran'
   expect_trace 'restore 50-alpha' 'the captured hook was restored'
+  expect_trace_count 'restore ' 1 'nothing but the captured hook was restored'
   session_state_is interrupt rolled-back &&
     ok 'state is rolled-back' || bad 'an interrupted arm left the session open'
-  expect_file "$(session_dir interrupt)/log" 'the aborted arm left a log'
+  # The abort is recorded in the marker, not in a watchdog log: the watchdog
+  # never started, so there is no log file for an arm that died capturing. The
+  # marker names the phase that failed, the state file names what caused it.
+  expect_reason interrupt snapshot-failed 'the marker records the capture as failed'
+  [[ $(state_get interrupt failed_hook) == interrupted ]] &&
+    ok 'the state file records the cause as an interrupt' ||
+    bad "failed_hook is '$(state_get interrupt failed_hook)', not interrupted"
 }
 
 test_grace_cuts_the_deadline_short() {
@@ -487,6 +580,70 @@ test_grace_cuts_the_deadline_short() {
   ok 'the rollback fired long before the ttl'
   expect_log grace 'session is gone' 'the watchdog saw the session drop'
   session_state_is grace rolled-back && ok 'state is rolled-back' || bad 'state is not rolled-back'
+}
+
+test_socket_probe_reads_either_layout() {
+  section 'the socket probe reads the endpoint pair, not a fixed column'
+  local n=0 row id
+  for row in "${SS_ROWS[@]}"; do
+    n=$((n + 1))
+    id="socklayout$n"
+    printf '%s\n' "$row" >"$SSTABLE"
+    run_with_ss --id "$id" --ttl 60 --hook 50-alpha arm
+    expect_rc 0 "arm against this table exits 0 ($row)"
+    expect_out 'probe=socket 192.0.2.2:22 192.0.2.1:45455' \
+      'the tuple is recorded local first, then peer'
+    run --id "$id" status
+    expect_out 'probe=socket' "status of layout $n reports a socket probe"
+    run --id "$id" disarm
+    expect_rc 0 "cleanup disarm of layout $n"
+  done
+}
+
+test_socket_loss_cuts_the_deadline() {
+  section 'a socket that disappears brings the deadline forward'
+  : >"$TRACE"
+  printf '%s\n' "${SS_ROWS[0]}" >"$SSTABLE"
+  run_with_ss --id sockdrop --ttl 600 --interval 1 --grace 0 --hook 50-alpha arm
+  expect_rc 0 'arm exits 0'
+  expect_out 'probe=socket' 'the socket probe was picked'
+  # The operator's connection drops mid-change: the table goes empty under a
+  # running watchdog, which has to roll back now rather than wait out the 600s
+  # deadline it was armed with.
+  : >"$SSTABLE"
+  if ! waits_for 15 has_marker "$(session_dir sockdrop)/ROLLED_BACK"; then
+    bad 'the switch waited for a 600s deadline on a dropped socket'
+    dump_log sockdrop
+    return 0
+  fi
+  ok 'the rollback fired on the dropped socket'
+  expect_log sockdrop 'session is gone' 'the watchdog saw the socket drop'
+  expect_trace 'restore 50-alpha' 'the captured hook was restored'
+  session_state_is sockdrop rolled-back && ok 'state is rolled-back' || bad 'state is not rolled-back'
+  expect_reason sockdrop expired 'the marker names the reason'
+}
+
+test_unreadable_socket_is_not_a_gone_session() {
+  section 'a socket table that cannot be read does not fire the rollback'
+  printf '%s\n' "${SS_ROWS[0]}" >"$SSTABLE"
+  run_with_ss --id sockblind --ttl 60 --interval 1 --grace 0 --hook 50-alpha arm
+  expect_rc 0 'arm exits 0'
+  expect_out 'probe=socket' 'the socket probe was picked'
+  # Deleting the file makes the fake ss exit non-zero, which is what an ss that is
+  # missing or refusing to answer looks like. This is the dangerous direction: a
+  # watchdog that read "cannot tell" as "the operator left" would roll back a live
+  # session within a second, which is what --grace 0 makes observable.
+  rm -f "$SSTABLE"
+  if waits_for 6 has_marker "$(session_dir sockblind)/ROLLED_BACK"; then
+    bad 'an unreadable socket table was read as a dropped session'
+    dump_log sockblind
+  else
+    ok 'an unreadable socket table did not fire the rollback'
+  fi
+  session_state_is sockblind armed && ok 'the session is still armed' || bad 'state is not armed'
+  run --id sockblind disarm
+  expect_rc 0 'cleanup disarm'
+  printf '%s\n' "${SS_ROWS[0]}" >"$SSTABLE"
 }
 
 test_probe_degrades_to_the_timer() {
@@ -526,7 +683,7 @@ test_extend_moves_the_deadline() {
     ok "the deadline moved by about two hours ($before to $after)" ||
     bad "extend did not move the deadline far enough ($before to $after)"
   run --id longer status
-  expect_out 'left=7' 'status counts down in minutes'
+  expect_out_matching 'left=[0-9]+m[0-9][0-9]s' 'status counts down in minutes'
   run --id longer disarm
   expect_rc 0 'cleanup disarm'
 }
@@ -544,7 +701,12 @@ test_dry_run_prints_privileged_commands() {
   expect_out 'DRY-RUN nft flush ruleset' 'the flush is printed'
   expect_out 'DRY-RUN nft -f' 'the reload is printed'
   expect_reason nft reviewed 'the manual rollback records its reason'
-  expect_no_trace 'flush' 'the plan never reached the trace log'
+  # The snapshot is a placeholder naming the command, not the output of a command
+  # that ran: this is the file a real rollback would load into nft.
+  expect_file_contains "$(session_dir nft)/snapshots/20-nftables/ruleset.nft" \
+    'DRYRUN nft list ruleset' 'the captured ruleset is a dry-run placeholder'
+  run --id nft disarm --purge
+  expect_rc 0 'cleanup disarm --purge'
 }
 
 test_recover_rolls_back_after_a_reboot() {
@@ -574,7 +736,8 @@ test_recover_restarts_a_watchdog() {
   kill_watchdog watched || return 0
   run --id watched recover
   expect_rc 0 'recover exits 0'
-  expect_out 'has 9m and no watchdog, starting a new one' 'the restart is logged'
+  expect_out_matching 'has [0-9]+m[0-9][0-9]s and no watchdog, starting a new one' \
+    'the restart is logged'
   local second_pid
   second_pid=$(watchpid_of watched)
   [[ $second_pid != "$first_pid" ]] &&
@@ -613,7 +776,7 @@ test_payload_failure_rolls_back_at_once() {
   expect_rc 1 'arm exits 1 when the change fails'
   expect_out 'the change itself exited' 'the failure is named'
   expect_trace 'restore 50-alpha' 'the rollback ran without waiting for the TTL'
-  expect_no_trace 'restore 60-beta' 'only captured hooks are restored'
+  expect_trace_count 'restore ' 1 'only the captured hook was restored'
   session_state_is payload rolled-back && ok 'state is rolled-back' || bad 'state is not rolled-back'
   expect_reason payload payload-failed 'the marker names the reason'
 }
@@ -652,6 +815,9 @@ test_failed_snapshot_aborts_before_the_change
 test_interrupted_capture_rolls_back
 test_skipped_hook_is_not_restored
 test_grace_cuts_the_deadline_short
+test_socket_probe_reads_either_layout
+test_socket_loss_cuts_the_deadline
+test_unreadable_socket_is_not_a_gone_session
 test_probe_degrades_to_the_timer
 test_extend_moves_the_deadline
 test_expiry_rolls_back_newest_first

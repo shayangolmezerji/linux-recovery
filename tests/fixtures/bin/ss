@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Stands in for iproute2's `ss` so the socket probe can be tested against a
+# table this harness wrote instead of the host's real sessions. The arguments
+# are ignored: what is under test is which column the endpoints land in, and
+# real iproute2 changes that between releases.
+set -euo pipefail
+
+cat "${DM_FAKE_SS_TABLE:?harness must set DM_FAKE_SS_TABLE}"

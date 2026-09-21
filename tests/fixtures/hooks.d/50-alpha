@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Test fixture hook. Records every call in $DM_TEST_TRACE so the harness can
+# assert on ordering, and writes a snapshot file that restore can check.
+# hook-opt nothing
+set -euo pipefail
+
+name=50-alpha
+action=${1:-}
+snap=${2:-}
+printf '%s %s\n' "$action" "$name" >>"${DM_TEST_TRACE:?harness must set DM_TEST_TRACE}"
+
+case $action in
+save) printf 'alpha state\n' >"$snap/note" ;;
+restore)
+  [[ -s $snap/note ]] || { printf 'alpha: no snapshot\n' >&2; exit 1; }
+  printf 'alpha restored %s\n' "$(cat "$snap/note")"
+  ;;
+*) exit 64 ;;
+esac

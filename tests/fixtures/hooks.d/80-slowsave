@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Test fixture hook that is slow to capture, so the harness can interrupt an arm
+# between the first snapshot and the second. Its save never finishes, which is
+# what makes it the hook that must not be restored.
+set -euo pipefail
+
+name=80-slowsave
+action=${1:-}
+snap=${2:-}
+printf '%s %s\n' "$action" "$name" >>"${DM_TEST_TRACE:?harness must set DM_TEST_TRACE}"
+
+case $action in
+save)
+  sleep 2
+  printf 'slow state\n' >"$snap/note"
+  ;;
+restore)
+  [[ -s $snap/note ]] || { printf 'slowsave: no snapshot\n' >&2; exit 1; }
+  printf 'slowsave restored\n'
+  ;;
+*) exit 64 ;;
+esac
