@@ -360,11 +360,13 @@ test_usage_errors() {
   expect_rc 2 'confirm with no session at all is a usage error'
 }
 
-# A hook name is the only user-supplied string this tool later executes as
-# root: arm writes it into hooks_saved, and the detached watchdog reads it back
-# and runs `restore` on it after a reboot. The shape check refuses a name that
-# is not one file name; the containment check refuses one that is well formed
-# but resolves outside the hook directory, which is what a symlink there does.
+# A hook name is the only user-supplied string that reaches an execution this
+# tool cannot re-check: arm writes it into hooks_saved, which the watchdog reads
+# back with word splitting, and that watchdog then runs the file the name names
+# from a process with no arguments left to validate, on the way to a hook that
+# escalates. The shape check refuses a name that is not one file name; the
+# containment check refuses one that is well formed but resolves outside the hook
+# directory, which is what a symlink there does.
 test_hook_names_cannot_escape_the_directory() {
   section 'a hostile hook name cannot be stored or run from outside hooks.d'
   # A scratch hook directory with an executable sitting next to it: pointing

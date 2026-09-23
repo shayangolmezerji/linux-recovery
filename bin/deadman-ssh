@@ -161,9 +161,11 @@ add_hook_name() {
   IFS=',' read -r -a pieces <<<"$raw"
   for piece in "${pieces[@]}"; do
     [[ -z $piece ]] && continue
-    # A name is stored in hooks_saved and run back by the detached watchdog as
-    # root, and hooks_saved is read with word splitting, so it has to be one
-    # plain file name: no separator, no whitespace, nothing dot-prefixed.
+    # The name goes into hooks_saved, which the watchdog reads back with word
+    # splitting, and it then runs the file that name names from a process with no
+    # arguments left to check. That file is the one that escalates, so the name
+    # has to be one plain file name: no separator, no whitespace, nothing
+    # dot-prefixed.
     case $piece in
     *[!a-zA-Z0-9._-]* | .*)
       die_usage "hook name '$piece' may only contain letters, digits, dot," \
