@@ -23,6 +23,7 @@ stop, delay or inspect a switch that is already running.
 
 - [How it decides](#how-it-decides)
 - [Requirements](#requirements)
+- [Sudoers](#sudoers)
 - [Installation](#installation)
 - [Usage](#usage)
 - [Writing a hook](#writing-a-hook)
@@ -89,10 +90,119 @@ from elsewhere, and why none of this is Python, is
 - `iproute2` for `ss`, only for the socket probe. Without it the switch falls
   back to the timer, it does not fail.
 - root or sudo only when a hook needs it. The switch itself never escalates.
-  Dry-run needs neither.
+  Dry-run needs neither. What the shipped hook escalates, and the sudoers rule
+  that lets it happen with nobody logged in, is [Sudoers](#sudoers).
 
 `nft` is only needed by the hook that ships here. Run that hook on a box
 without nftables and it exits 77, which the switch records as a skip.
+
+## Sudoers
+
+The switch never escalates, and a hook that restores a firewall has to. What
+gets run as root, the rule it needs, and what that rule then costs. Read this
+before the first arm that is not a dry run.
+
+### What is actually run as root
+
+`lib/deadman-lib.sh` is the only place privilege is touched. `dm_priv`,
+`dm_priv_in` and `dm_capture` outside dry-run each put `$DEADMAN_RUNNER`,
+default `sudo -n`, in front of their arguments. One hook ships,
+`hooks.d/20-nftables`, and it asks for exactly three argv lists:
+
+```
+sudo -n nft list ruleset     # dm_capture at arm time
+sudo -n nft flush ruleset    # dm_priv at restore
+sudo -n nft -f <snapshot>    # dm_priv at restore
+```
+
+That is the whole of it for the shipped hook. The redirect into the snapshot is
+done by your own shell, not by the escalated one, so root needs read access to
+the snapshot file and write access to nothing. A hook of yours adds its own
+commands to that list, and the rule has to name those too: the
+`dm_priv_in cp /dev/stdin /etc/resolv.conf` in the example hook is a fourth
+escalation the nft rule above would not cover.
+
+### Why the rule has to be NOPASSWD
+
+The process that runs the rollback has no terminal. The watchdog is started with
+`setsid nohup` and stdin on `/dev/null`, which is the whole point of it: it keeps
+watching after your login goes. After a reboot `recover` is the only command
+allowed to act on the session, and whatever starts it from a unit has no terminal
+either. Typed by hand from a console it does have one, and that is the only case
+where a password prompt is possible. `-n` is the honest form of the rest of it:
+[sudo(8)](https://man7.org/linux/man-pages/man8/sudo.8.html) documents it as
+avoiding prompting for input of any kind, with sudo displaying an error and
+exiting if a password is required. A sudo that wants a password there does not
+delay the rollback, it never runs, on the one machine you cannot reach. So the
+grant has to be `NOPASSWD`, and `NOPASSWD` means no password stands between your
+account and those three commands.
+
+Setting `DEADMAN_RUNNER=sudo` to get prompting back does not help: the arm
+records the runner in the session's state file and every later process that
+reaches a hook reads it out again, so the watchdog would run an interactive sudo
+with no terminal, which is the same failure with a worse message.
+
+### The smallest rule that still recovers
+
+One file in `/etc/sudoers.d`, a name with no dot in it because an
+`@includedir` skips files that have one, absolute paths, and one entry per argv
+list rather than a wildcard over the `nft` argument space. Write this as
+`99-deadman-ssh`, with your user, your `nft` path and your state directory:
+
+```
+deploy ALL=(root) NOPASSWD: /usr/sbin/nft list ruleset, \
+    /usr/sbin/nft flush ruleset, \
+    /usr/sbin/nft -f /home/deploy/.local/state/deadman-ssh/sessions/*/snapshots/20-nftables/ruleset.nft
+```
+
+```bash
+visudo -cf ./99-deadman-ssh
+sudo install -m 0440 ./99-deadman-ssh /etc/sudoers.d/99-deadman-ssh
+```
+
+[sudoers(5)](https://man7.org/linux/man-pages/man5/sudoers.5.html) gives 0440 as
+the mode for a sudoers file. Two more things about that block:
+
+- `/usr/sbin/nft` is where the package usually puts the tool, not a promise
+  about your box, so use what `command -v nft` prints. The hook names it
+  unqualified and sudo resolves a bare name through its own `secure_path` rather
+  than through yours, so the rule has to carry the path that resolves.
+- A sudoers file that does not parse does nothing, for you and for everyone else
+  on that host. Check the fragment with `visudo -cf` before it is in place.
+
+Then confirm the grant from a process shaped like the one that will need it:
+
+```bash
+setsid bash -c 'sudo -n nft list ruleset >/dev/null; echo "rc=$?"' </dev/null
+```
+
+`rc=0` is what the watchdog will see. Anything else and the switch still fires,
+with nothing able to run the restore. A site that has set `requiretty` fails here
+for the same reason the watchdog has no terminal:
+[sudoers(5)](https://man7.org/linux/man-pages/man5/sudoers.5.html) documents the
+flag as off by default, and where it is on, sudo wants a real tty.
+
+### What the rule costs afterwards
+
+- Anything running as you can spend it, without a password, at any time. The
+  change you hand to `arm --` qualifies, every hook in the directory qualifies,
+  and so does any unrelated process that gets code execution as that user. It
+  can flush a live ruleset, which is a denial of service that does not need the
+  switch armed at all.
+- The `*` in the snapshot path is not a boundary.
+  [sudoers(5)](https://man7.org/linux/man-pages/man5/sudoers.5.html) is explicit
+  that a wildcard matching command line arguments matches a forward slash and
+  white space too, and the path is assembled from `DEADMAN_STATE_DIR`, which the
+  arm takes from its own environment. `sessions/*` can therefore match a path
+  with extra segments in it. Keep the state directory somewhere fixed and not
+  writable by anyone else, and read the pattern as a shape check, not as
+  confinement.
+- The grant outlives the session. Nothing in this tool removes the file when you
+  `disarm --purge`. It is standing privilege on the host until you delete it.
+- It is `(root)`, so the compromise of that one account is the compromise of the
+  host, not of its firewall. That is the price of an unattended restore. Arm from
+  the account that has the hooks it needs and nothing more, and do not put this
+  rule on a shared admin id.
 
 ## Installation
 
@@ -226,6 +336,14 @@ rollback, and `--grace` becomes dead weight.
 
 A hook is an executable file in the hook directory. The switch knows nothing
 about what it rolls back; it only orders the calls.
+
+The name has to be one path element, with no leading dot, and the file has to be
+inside the hook directory once symlinks are followed. `--hook` refuses everything
+else, and `arm` refuses a listed entry that resolves elsewhere, so a symlink out
+of the directory is not a way to keep a hook somewhere else. The name is written
+into the session's state file, and the detached watchdog runs the file it names
+from a process with no arguments left to check, so a mistake here is caught at
+the arm or not at all.
 
 ```
 $ deadman-ssh hooks
@@ -384,7 +502,7 @@ rollback and a reconciliation.
 bash tests/run.sh
 ```
 
-24 groups, 201 checks, about 29 seconds: all pass, 1 skipped. Plain
+25 groups, 219 checks, about 28 seconds: all pass, 1 skipped. Plain
 bash and coreutils: the
 box you administer has neither bats nor pytest, and a switch that can only be
 tested on a developer machine is not testable where it runs. `bats` is not
@@ -420,8 +538,10 @@ trusting the switch on a box you care about.
 
 ### Exercised by the suite
 
-Argument validation, help, hook listing, capture ordering, `--opt` reaching a
-hook, expiry rolling back newest-first, confirm standing the watchdog down,
+Argument validation, including a hook name refused for being a path rather than
+a name, and a well formed one refused for resolving outside the hook directory,
+help, hook listing, capture ordering, `--opt` reaching a hook, expiry rolling
+back newest-first, confirm standing the watchdog down,
 extend moving a deadline, double arm refused with exit 3, disarm and purge, a
 hook skipped with 77 never restored, a failing capture aborting the arm before
 the change, a signal during capture restoring what was taken, a non-zero
@@ -499,6 +619,14 @@ real SSH session, and `shellcheck` has never run on this machine.
   it is not implemented here and the exposure above is unverified against a
   real session teardown. Until it is settled, `deadman-ssh status` from a
   second machine is part of the procedure, not a convenience.
+- **The sudoers rule the restore depends on.** The narrow `NOPASSWD` grant is
+  what lets a rollback run at all when nothing has a terminal: the detached
+  watchdog, and a `recover` started after a boot, cannot answer a password
+  prompt. It is also a passwordless path from your own account to
+  `nft flush ruleset`, open to anything running as that user, switch armed or
+  not, and it is still in place after you purge the session. Nothing here takes
+  it back, so keep it the size of the hooks that need it: see
+  [Sudoers](#sudoers).
 - **A change that breaks something a hook does not cover.** The switch restores
   what the hooks captured. A wrong route with no route hook rolls back nothing.
 - **A machine that stays up but is wedged.** Liveness of the SSH socket is not
