@@ -3,7 +3,8 @@
 ## Status
 
 Accepted. 2026-09-23. The consequences section records two exposures found
-while writing this, one measured and one that a test now reports red.
+while writing this, one measured and one that a test caught red. The second
+was fixed the same day, by `126d7e6`, and the consequences say so.
 
 ## Context
 
@@ -108,15 +109,19 @@ The costs, named rather than argued away:
 
 - **Process boundaries are invisible.** A shell variable's visibility in a
   child process depends on whether something happened to `export` it, and
-  nothing at the call site says so. This produced a real defect found during
-  this pass: `DEADMAN_LIB` is exported by `cmd_arm` and nowhere else, so a hook
-  run by an operator's `rollback` or by a watchdog that `recover` restarted
-  cannot source the library it needs for `dm_priv`. In Python the same design
-  passes a context to the hook runner and a missing field is an error at the
-  call rather than a rollback that fails at 3 a.m. Two checks in `tests/run.sh`
-  are red about this and stay red, because fixing it means changing behaviour
-  and the fix deserves its own review. The README documents the workaround:
-  derive the library path from the hook's own location, as `20-nftables` does.
+  nothing at the call site says so. This produced a real defect: `DEADMAN_LIB`
+  was exported by `cmd_arm` and nowhere else, so a hook run by an operator's
+  `rollback` or by a watchdog that `recover` restarted could not source the
+  library it needs for `dm_priv`. In Python the same design passes a context to
+  the hook runner and a missing field is an error at the call rather than a
+  rollback that fails at 3 a.m. The suite caught it and left it red. The
+  fixture `40-libseen` asserts the guarantee from three processes, two of those
+  checks failed, and the fix changes behaviour, so it was reported rather than
+  worked around. `126d7e6` moved the export from `cmd_arm` into `run_hook`, the
+  only place a hook is invoked, so it happens at the call in whichever process
+  reached it, and added the `recover` reboot check nothing had covered.
+  Deriving the library path from the hook's own location, as `20-nftables`
+  does, survives as a fallback.
 - **Error handling is a discipline, not a mechanism.** `set -euo pipefail` plus
   deliberate `|| rc=$?` at the places that must keep going (`run_hook`,
   `do_rollback`) is the whole story, and one missing `|| rc=$?` turns a
@@ -167,8 +172,6 @@ Read as a contract, and nothing beyond it:
 
 ## Open questions
 
-- Exporting `DEADMAN_LIB` where hooks run is a one-line change with a red test
-  waiting to go green. It is deliberately not in this pass.
 - A route or interface hook would make the tool useful for changes other than
   firewalls. `hooks.d` is the seam; the switch itself needs nothing.
 - The watchdog's own liveness is asserted nowhere. A `--probe-only` mode or a
