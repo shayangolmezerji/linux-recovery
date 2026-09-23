@@ -345,6 +345,12 @@ into the session's state file, and the detached watchdog runs the file it names
 from a process with no arguments left to check, so a mistake here is caught at
 the arm or not at all.
 
+`rollback` and `recover` refuse a stored name that points outside the hook
+directory, count it as a failed hook, and still attempt every other one. That
+read is defence in depth, not a new boundary: editing the state file means
+already having write access to the arming user's directory, and what it catches
+is a file armed by a build that predates the checks above.
+
 ```
 $ deadman-ssh hooks
 hook directory: /home/deploy/deadman-ssh/hooks.d
@@ -502,7 +508,7 @@ rollback and a reconciliation.
 bash tests/run.sh
 ```
 
-25 groups, 219 checks, about 28 seconds: all pass, 1 skipped. Plain
+26 groups, 229 checks, about 28 seconds: all pass, 1 skipped. Plain
 bash and coreutils: the
 box you administer has neither bats nor pytest, and a switch that can only be
 tested on a developer machine is not testable where it runs. `bats` is not
@@ -539,8 +545,9 @@ trusting the switch on a box you care about.
 ### Exercised by the suite
 
 Argument validation, including a hook name refused for being a path rather than
-a name, and a well formed one refused for resolving outside the hook directory,
-help, hook listing, capture ordering, `--opt` reaching a hook, expiry rolling
+a name, a well formed one refused for resolving outside the hook directory, and
+the same containment applied to a name read back out of the state file, help,
+hook listing, capture ordering, `--opt` reaching a hook, expiry rolling
 back newest-first, confirm standing the watchdog down,
 extend moving a deadline, double arm refused with exit 3, disarm and purge, a
 hook skipped with 77 never restored, a failing capture aborting the arm before

@@ -424,6 +424,54 @@ test_hook_names_cannot_escape_the_directory() {
   expect_rc 0 'cleanup disarm --purge'
 }
 
+# The state file is the second boundary. hooks_saved is read back at recover
+# time by a process that never saw the arm's arguments, long after the write and
+# possibly by a build that is not the one that wrote it. The name it holds
+# picks the file that runs as the arming user, so the containment resolve_hooks
+# applies to a typed name has to apply to a stored one too.
+test_stored_hook_names_are_contained_at_recover() {
+  section 'a hook name read back from the state file is contained too'
+  local dir=$WORK/restore-hooks outside=$WORK/restore-outside
+  mkdir -p "$dir" "$outside"
+  cp "$FIXTURE_HOOKS/50-alpha" "$dir/50-alpha"
+  cp "$FIXTURE_HOOKS/60-beta" "$outside/60-beta"
+  : >"$TRACE"
+
+  run_with_env "DEADMAN_HOOKS_DIR=$dir" --id stored --ttl 600 --hook 50-alpha arm
+  expect_rc 0 'the session under test arms'
+  kill_watchdog stored || return 0
+  # The reboot branch of recover, because that is the read made by a build other
+  # than the one that armed the session.
+  printf 'boot-after-reboot\n' >"$BOOTID"
+
+  # What a build that predates the name check stored, since --hook took paths
+  # then: the traversal sits next to the plain name it also stored.
+  local file=$(session_dir stored)/state line tmp
+  tmp=$file.tmp
+  while IFS= read -r line; do
+    [[ $line == hooks_saved=* ]] &&
+      line='hooks_saved=50-alpha ../restore-outside/60-beta'
+    printf '%s\n' "$line"
+  done <"$file" >"$tmp"
+  mv "$tmp" "$file"
+
+  run --id stored recover
+  expect_rc 0 'recover of the session with a traversal stored exits 0'
+  expect_out 'hook ../restore-outside/60-beta is not a plain file inside' \
+    'the stored name is refused the way a typed one is'
+  expect_no_trace '60-beta' 'and the executable outside the hook directory never ran'
+  expect_no_file "$(session_dir stored)/restore-outside" \
+    'and the refused name built no snapshot directory either'
+  expect_trace 'restore 50-alpha' 'the hook that is contained still restored'
+  expect_out '1 hook(s) failed' 'the refusal is reported as a failed hook'
+  session_state_is stored rollback-failed &&
+    ok 'and the session is not marked restored' ||
+    bad 'a refused stored name left the session looking rolled back'
+  printf 'boot-under-test\n' >"$BOOTID"
+  run --id stored disarm --purge
+  expect_rc 0 'cleanup disarm --purge'
+}
+
 test_help_and_hooks() {
   section 'help and hook listing'
   run --help
@@ -986,6 +1034,7 @@ note "scratch state: $WORK"
 
 test_usage_errors
 test_hook_names_cannot_escape_the_directory
+test_stored_hook_names_are_contained_at_recover
 test_help_and_hooks
 test_shellcheck_if_present
 test_arm_captures_snapshots

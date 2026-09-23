@@ -138,8 +138,8 @@ session_export_env() {
 available_hooks() {
   # No name check here: the glob is not recursive and basename drops the
   # directory, so every name this prints is one element inside it. A listed
-  # entry can still be a symlink, which is the job of the containment check in
-  # resolve_hooks, for this list as much as for --hook.
+  # entry can still be a symlink, which is the job of hook_is_contained, for
+  # this list as much as for --hook.
   local entry
   [[ -d $DEADMAN_HOOKS_DIR ]] || return 0
   for entry in "$DEADMAN_HOOKS_DIR"/*; do
@@ -177,20 +177,34 @@ add_hook_name() {
   return 0
 }
 
+# The rule that decides whether a name may pick a file to run: one path element,
+# and this directory's own file once symlinks are followed. A prefix test is the
+# weaker form of this, the one a trailing slash or a dot-dot is argued about. The
+# element check is here rather than taken on faith because a rollback asks the
+# rule of a name read out of the state file, written by whichever build armed the
+# session. The arm's ban on a leading dot is not part of it: a dot file is
+# invisible to the listing, which is the arm's problem and not an escape.
+hook_is_contained() {
+  local name="$1" base
+  case $name in
+  '' | */*) return 1 ;;
+  esac
+  [[ -d $DEADMAN_HOOKS_DIR ]] || return 1
+  base=$(readlink -f -- "$DEADMAN_HOOKS_DIR") || return 1
+  [[ $(readlink -f -- "$DEADMAN_HOOKS_DIR/$name") == "$base/$name" ]]
+}
+
 resolve_hooks() {
-  local name path base='' seen=' '
+  local name path seen=' '
   DM_HOOK_PATHS=()
-  # Every name reaching this point is one path element: add_hook_name refuses
-  # anything else and available_hooks prints basenames. What is left is a symlink
-  # inside the directory, so resolve the path and require exactly the file the
-  # name names. A prefix test is the weaker form of this, the one a trailing
-  # slash or a dot-dot is argued about.
-  [[ -d $DEADMAN_HOOKS_DIR ]] && base=$(readlink -f -- "$DEADMAN_HOOKS_DIR")
+  # add_hook_name has refused anything that is not one plain name, and
+  # available_hooks prints basenames, so what hook_is_contained has left to
+  # catch here is the symlink inside the directory that points out of it.
   if ((${#DM_HOOK_NAMES[@]} == 0)); then
     while IFS= read -r name; do
       [[ -n $name ]] || continue
       path="$DEADMAN_HOOKS_DIR/$name"
-      [[ $(readlink -f -- "$path") == "$base/$name" ]] ||
+      hook_is_contained "$name" ||
         die_usage "hook '$name' is not a plain file inside $DEADMAN_HOOKS_DIR"
       DM_HOOK_PATHS+=("$path")
     done < <(available_hooks)
@@ -204,7 +218,7 @@ resolve_hooks() {
     path="$DEADMAN_HOOKS_DIR/$name"
     [[ -f $path && -x $path ]] ||
       die_usage "no executable hook named '$name' in $DEADMAN_HOOKS_DIR"
-    [[ $(readlink -f -- "$path") == "$base/$name" ]] ||
+    hook_is_contained "$name" ||
       die_usage "hook '$name' is not a plain file inside $DEADMAN_HOOKS_DIR"
     DM_HOOK_PATHS+=("$path")
   done
@@ -332,16 +346,26 @@ session_is_live() {
 # hook does not stop the rest: a half-restored host needs every remaining hook
 # attempted and a complete record of what broke.
 do_rollback() {
-  local id="$1" reason="$2" file index hook snap failures=0
+  local id="$1" reason="$2" file index name hook snap failures=0
   local -a saved
   file=$(dm_state_file "$id")
   read -r -a saved <<<"$(dm_state_get "$file" hooks_saved 2>/dev/null || true)"
   dm_log "rollback[$reason]: $(( ${#saved[@]} )) hook(s) to restore, newest first"
   for ((index = ${#saved[@]} - 1; index >= 0; index--)); do
-    hook="$DEADMAN_HOOKS_DIR/${saved[index]}"
-    snap=$(snapshot_dir_for "$id" "${saved[index]}")
+    name="${saved[index]}"
+    hook="$DEADMAN_HOOKS_DIR/$name"
+    snap=$(snapshot_dir_for "$id" "$name")
     if [[ ! -x $hook ]]; then
-      dm_warn "rollback[$reason]: hook ${saved[index]} is gone from $DEADMAN_HOOKS_DIR"
+      dm_warn "rollback[$reason]: hook $name is gone from $DEADMAN_HOOKS_DIR"
+      failures=$((failures + 1))
+      continue
+    fi
+    # A name read off disk, not typed at the arm: the build that wrote the file
+    # may predate add_hook_name, and this name picks the file the process runs.
+    # hook_is_contained asks it the question resolve_hooks asks a typed one, and
+    # a refusal counts as a failed hook so the rest of the list is still restored.
+    if ! hook_is_contained "$name"; then
+      dm_warn "rollback[$reason]: hook $name is not a plain file inside $DEADMAN_HOOKS_DIR"
       failures=$((failures + 1))
       continue
     fi
