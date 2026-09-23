@@ -460,7 +460,8 @@ test_stored_hook_names_are_contained_at_recover() {
 
   # What a build that predates the name check stored, since --hook took paths
   # then: the traversal sits next to the plain name it also stored.
-  local file=$(session_dir stored)/state line tmp
+  local file line tmp
+  file=$(session_dir stored)/state
   tmp=$file.tmp
   while IFS= read -r line; do
     [[ $line == hooks_saved=* ]] &&
