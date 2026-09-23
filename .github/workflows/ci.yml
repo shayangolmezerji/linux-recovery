@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Nothing in this workflow may change the runner's network configuration. The
+# tool under test rewrites firewalls, so the job holds the boundary the test
+# harness holds itself to: no nft, iptables, ip, tc or systemctl, no module
+# loading, no writes under /etc, and no process this job did not start is ever
+# signalled. DEADMAN_RUNNER is a belt for the harness's braces. Every call to
+# the escalator is pinned to `false` by tests/run.sh anyway, so if a future
+# test forgets, it fails instead of running something as root.
+env:
+  DEADMAN_RUNNER: 'false'
+
+jobs:
+  lint:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      # shellcheck cannot be installed on the machine this code was written on
+      # (no root, no package), so this is the first place the tree is linted at
+      # all. apt rather than a downloaded release, to keep the provenance short.
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+          shellcheck --version
+
+      # Gate: --severity=error. That level carries the bugs that break a
+      # rollback, quoting and expansion mostly, and nothing has ever checked
+      # this tree at any level.
+      #
+      # The warning level is reported by the next step instead of gating, and
+      # tests/run.sh uses --severity=warning when the tool is present locally.
+      # The two thresholds are deliberately different until someone reads the
+      # warning report once: an unverified threshold should not be what turns
+      # main red, and a gate nobody has seen pass is not a gate. When the
+      # report comes back clean, or triaged with a reason at each site, change
+      # error to warning below and delete the report step.
+      - name: shellcheck, gates the build
+        run: |
+          set -euo pipefail
+          for file in bin/deadman-ssh lib/deadman-lib.sh hooks.d/* \
+                      tests/run.sh tests/fixtures/bin/ss \
+                      tests/fixtures/hooks.d/*; do
+            shellcheck --severity=error "$file"
+          done
+
+      # Non-fatal, and not a substitute for the gate above. Its whole job is to
+      # be read once and turned into either a fix or a threshold change.
+      - name: shellcheck, reports only
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          for file in bin/deadman-ssh lib/deadman-lib.sh hooks.d/* \
+                      tests/run.sh tests/fixtures/bin/ss \
+                      tests/fixtures/hooks.d/*; do
+            shellcheck --severity=warning "$file"
+          done
+
+  syntax:
+    name: bash -n
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      # The check that did run locally, on every file, and is the floor this
+      # repo's claims about syntax rest on. Cheap, and a parse error should read
+      # as one rather than as twenty failed checks inside the suite.
+      - name: Syntax check every shell file
+        run: |
+          set -euo pipefail
+          for file in bin/deadman-ssh lib/deadman-lib.sh hooks.d/* \
+                      tests/run.sh tests/fixtures/bin/ss \
+                      tests/fixtures/hooks.d/*; do
+            printf '%-38s ' "$file"
+            bash -n "$file" && printf 'ok\n'
+          done
+
+  test:
+    name: suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      # Fatal on purpose, and red on main until a known fix lands. Two checks
+      # fail: DEADMAN_LIB is exported by the arm process only, so a hook that
+      # cannot derive the library from its own location fails at the moment it
+      # is asked to restore. That is a defect in the switch, reported rather
+      # than worked around. See "Known defect" in README.md. Making this step
+      # non-fatal would be the wrong way to get a green check mark.
+      - name: Test suite
+        run: bash tests/run.sh
