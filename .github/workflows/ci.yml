@@ -25,7 +25,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v4
+      # Pinned to a commit rather than a moving major tag: a takeover of the
+      # upstream tag would otherwise change what runs before the first test.
+      # Dependabot opens the PRs that move these hashes.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # shellcheck cannot be installed on the machine this code was written on
       # (no root, no package), so this is the first place the tree is linted at
@@ -73,7 +76,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # The check that did run locally, on every file, and is the floor this
       # repo's claims about syntax rest on. Cheap, and a parse error should read
@@ -93,7 +96,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       # Fatal on purpose: this suite is the only evidence a rollback can still
       # run end to end, so a green check mark here has to mean something.
