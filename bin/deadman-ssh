@@ -136,6 +136,10 @@ session_export_env() {
 # afterwards. Exit 77 means "not applicable here".
 
 available_hooks() {
+  # No name check here: the glob is not recursive and basename drops the
+  # directory, so every name this prints is one element inside it. A listed
+  # entry can still be a symlink, which is the job of the containment check in
+  # resolve_hooks, for this list as much as for --hook.
   local entry
   [[ -d $DEADMAN_HOOKS_DIR ]] || return 0
   for entry in "$DEADMAN_HOOKS_DIR"/*; do
@@ -148,20 +152,45 @@ available_hooks() {
 add_hook_name() {
   local raw="$1" piece
   local -a pieces
+  # Checked before the split, not after it: `read` stops at the first line, so a
+  # name carrying a newline would be dropped and the arm would go ahead with a
+  # different hook list than the one that was typed.
+  case $raw in
+  *$'\n'*) die_usage '--hook takes names on one line, not a line break' ;;
+  esac
   IFS=',' read -r -a pieces <<<"$raw"
   for piece in "${pieces[@]}"; do
     [[ -z $piece ]] && continue
+    # A name is stored in hooks_saved and run back by the detached watchdog as
+    # root, and hooks_saved is read with word splitting, so it has to be one
+    # plain file name: no separator, no whitespace, nothing dot-prefixed.
+    case $piece in
+    *[!a-zA-Z0-9._-]* | .*)
+      die_usage "hook name '$piece' may only contain letters, digits, dot," \
+        "dash and underscore, and must not start with a dot"
+      ;;
+    esac
     DM_HOOK_NAMES+=("$piece")
   done
   return 0
 }
 
 resolve_hooks() {
-  local name path seen=' '
+  local name path base='' seen=' '
   DM_HOOK_PATHS=()
+  # Every name reaching this point is one path element: add_hook_name refuses
+  # anything else and available_hooks prints basenames. What is left is a symlink
+  # inside the directory, so resolve the path and require exactly the file the
+  # name names. A prefix test is the weaker form of this, the one a trailing
+  # slash or a dot-dot is argued about.
+  [[ -d $DEADMAN_HOOKS_DIR ]] && base=$(readlink -f -- "$DEADMAN_HOOKS_DIR")
   if ((${#DM_HOOK_NAMES[@]} == 0)); then
     while IFS= read -r name; do
-      [[ -n $name ]] && DM_HOOK_PATHS+=("$DEADMAN_HOOKS_DIR/$name")
+      [[ -n $name ]] || continue
+      path="$DEADMAN_HOOKS_DIR/$name"
+      [[ $(readlink -f -- "$path") == "$base/$name" ]] ||
+        die_usage "hook '$name' is not a plain file inside $DEADMAN_HOOKS_DIR"
+      DM_HOOK_PATHS+=("$path")
     done < <(available_hooks)
     return 0
   fi
@@ -173,6 +202,8 @@ resolve_hooks() {
     path="$DEADMAN_HOOKS_DIR/$name"
     [[ -f $path && -x $path ]] ||
       die_usage "no executable hook named '$name' in $DEADMAN_HOOKS_DIR"
+    [[ $(readlink -f -- "$path") == "$base/$name" ]] ||
+      die_usage "hook '$name' is not a plain file inside $DEADMAN_HOOKS_DIR"
     DM_HOOK_PATHS+=("$path")
   done
   return 0

@@ -360,6 +360,68 @@ test_usage_errors() {
   expect_rc 2 'confirm with no session at all is a usage error'
 }
 
+# A hook name is the only user-supplied string this tool later executes as
+# root: arm writes it into hooks_saved, and the detached watchdog reads it back
+# and runs `restore` on it after a reboot. The shape check refuses a name that
+# is not one file name; the containment check refuses one that is well formed
+# but resolves outside the hook directory, which is what a symlink there does.
+test_hook_names_cannot_escape_the_directory() {
+  section 'a hostile hook name cannot be stored or run from outside hooks.d'
+  # A scratch hook directory with an executable sitting next to it: pointing
+  # --hook at the repo's own tree would make the escape test depend on a file
+  # the harness has no business running.
+  local dir=$WORK/escape-hooks outside=$WORK/escape-outside
+  mkdir -p "$dir" "$outside"
+  cp "$FIXTURE_HOOKS/50-alpha" "$dir/50-alpha"
+  cp "$FIXTURE_HOOKS/60-beta" "$outside/60-beta"
+  ln -s "$outside/60-beta" "$dir/30-link"
+  : >"$TRACE"
+
+  run_with_env "DEADMAN_HOOKS_DIR=$dir" --id slash --ttl 300 \
+    --hook 50-alpha --hook '../escape-outside/60-beta' arm
+  expect_rc 2 'a hook name with a slash is refused'
+  expect_out 'may only contain letters' 'and the refusal says what a name is'
+  expect_no_trace 'save 60-beta' 'nothing outside the hook directory was run'
+  expect_no_file "$(session_dir slash)" 'the refused arm stored no session'
+
+  run_with_env "DEADMAN_HOOKS_DIR=$dir" --id comma --ttl 300 \
+    --hook '50-alpha,../escape-outside/60-beta' arm
+  expect_rc 2 'a comma list is checked piece by piece, not as a whole'
+  expect_no_trace 'save 60-beta' 'and the good piece did not buy a pass for the bad one'
+
+  run_with_env "DEADMAN_HOOKS_DIR=$dir" --id dotdot --ttl 300 \
+    --hook '..' arm
+  expect_rc 2 'the parent directory is not a hook name'
+
+  # --hook is split with read, which stops at a line break. Without a refusal
+  # the rest of the value disappears and the arm captures a different list of
+  # hooks from the one that was typed.
+  run_with_env "DEADMAN_HOOKS_DIR=$dir" --id newline --ttl 300 \
+    --hook $'50-alpha\nhooks_saved=' arm
+  expect_rc 2 'a hook name spanning a line is refused outright'
+  expect_no_file "$(session_dir newline)" 'and nothing was armed behind the refusal'
+
+  # Well formed, executable, and still not this directory's file to run.
+  run_with_env "DEADMAN_HOOKS_DIR=$dir" --id symlink --ttl 300 \
+    --hook 30-link arm
+  expect_rc 2 'a hook that resolves outside the directory is refused'
+  expect_out 'is not a plain file inside' 'and the refusal names the directory'
+  expect_no_trace 'save 60-beta' 'and the target never ran'
+
+  # The same entry reached through the default listing instead of --hook.
+  run_with_env "DEADMAN_HOOKS_DIR=$dir" --id listed --ttl 300 arm
+  expect_rc 2 'the default listing is held to the same containment'
+  expect_no_trace 'save 60-beta' 'so an escaping entry is not silently captured'
+
+  run --id normal --ttl 300 --hook 50-alpha arm
+  expect_rc 0 'a plain arm still works after all of those refusals'
+  expect_out 'hook 50-alpha: save ok' 'and the fixture hooks are untouched'
+  run --id normal status
+  expect_out 'saved=[50-alpha]' 'hooks_saved holds one plain name'
+  run --id normal disarm --purge
+  expect_rc 0 'cleanup disarm --purge'
+}
+
 test_help_and_hooks() {
   section 'help and hook listing'
   run --help
@@ -921,6 +983,7 @@ note "deadman-ssh test harness"
 note "scratch state: $WORK"
 
 test_usage_errors
+test_hook_names_cannot_escape_the_directory
 test_help_and_hooks
 test_shellcheck_if_present
 test_arm_captures_snapshots
