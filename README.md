@@ -78,6 +78,10 @@ Three rules hold everywhere in the code:
 - Rollback runs newest captured hook first, and a failing hook does not stop
   the ones after it.
 
+Why the switch is keyed on your session rather than on a healthcheck that runs
+from elsewhere, and why none of this is Python, is
+[ADR 0001](docs/adr/0001-deadman-switch-on-session-liveness-in-bash.md).
+
 ## Requirements
 
 - bash 4 or newer (`local -a`, `mapfile`, `${var^^}`).
