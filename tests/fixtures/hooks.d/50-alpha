@@ -10,7 +10,12 @@ snap=${2:-}
 printf '%s %s\n' "$action" "$name" >>"${DM_TEST_TRACE:?harness must set DM_TEST_TRACE}"
 
 case $action in
-save) printf 'alpha state\n' >"$snap/note" ;;
+save)
+  printf 'alpha state\n' >"$snap/note"
+  # Only written when the switch passed --opt NOTE, so the harness can see the
+  # option arrive in the hook's environment instead of taking that on faith.
+  [[ -z ${DEADMAN_OPT_NOTE:-} ]] || printf 'note=%s\n' "$DEADMAN_OPT_NOTE" >>"$snap/note"
+  ;;
 restore)
   [[ -s $snap/note ]] || { printf 'alpha: no snapshot\n' >&2; exit 1; }
   printf 'alpha restored %s\n' "$(cat "$snap/note")"

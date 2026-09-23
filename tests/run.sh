@@ -377,6 +377,10 @@ test_help_and_hooks() {
   expect_rc 0 'hooks exits 0'
   expect_out '50-alpha' 'the fixture hooks are listed'
   expect_out 'hook directory:' 'and says which directory was read'
+  # cmd_hooks reads the `# hook-opt` marker out of the hook itself, so an
+  # operator sees what a hook accepts without opening it.
+  expect_out_matching '50-alpha[[:space:]]+opts: nothing' 'a declared option is listed'
+  expect_out_matching '60-beta[[:space:]]+opts: none' 'a hook with none says so'
 }
 
 test_arm_captures_snapshots() {
@@ -397,6 +401,56 @@ test_arm_captures_snapshots() {
   expect_out 'dry_run=1' 'status reports the session ran in dry-run'
   run --id cap disarm
   expect_rc 0 'cleanup disarm'
+}
+
+# DEADMAN_OPT_<KEY> is exported only by the arm process. A rollback is a separate
+# invocation, and the detached watchdog even more so, so an option earns its
+# keep only if the hook captured its effect into the snapshot: the restore half
+# of this test runs in a process that never saw --opt at all.
+test_options_reach_the_hook() {
+  section '--opt is exported to the hook as DEADMAN_OPT_<KEY>'
+  run --id opt --ttl 300 --hook 50-alpha --opt NOTE=by-hand arm
+  expect_rc 0 'arm with --opt exits 0'
+  expect_file_contains "$(session_dir opt)/snapshots/50-alpha/note" \
+    'note=by-hand' 'the hook saw the option while capturing'
+  run --id opt rollback --reason reviewed
+  expect_rc 4 'the rollback reports that it fired'
+  expect_out 'alpha restored alpha state' 'the hook ran its restore'
+  expect_out 'note=by-hand' 'the value comes back from the snapshot, not the option'
+  run --id opt status
+  expect_out 'state=rolled-back' 'the session shows the rollback'
+  run --id opt disarm --purge
+  expect_rc 0 'cleanup disarm --purge'
+}
+
+# Two of the three hook invocations happen in a process that never parsed the
+# arm's arguments: `rollback` from an operator typing it, and the detached
+# `watch` that fires on its own. Both have to hand a hook the library anyway, or
+# the rollback a hook exists to perform is the one thing it cannot do.
+test_hooks_see_the_library_in_every_process() {
+  section 'DEADMAN_LIB reaches a hook in every process that runs one'
+  : >"$TRACE"
+  run --id libcli --ttl 300 --hook 40-libseen arm
+  expect_rc 0 'arm exits 0'
+  expect_file_contains "$(session_dir libcli)/snapshots/40-libseen/note" \
+    'DEADMAN_LIB=' 'the arm handed the hook a library path'
+  run --id libcli rollback --reason reviewed
+  expect_rc 4 'a rollback from a second process exits 4'
+  expect_out 'hook 40-libseen: restore ok' 'and the hook found the library there'
+  run --id libcli disarm --purge
+  expect_rc 0 'cleanup disarm --purge'
+
+  run --id libfire --ttl 1 --interval 1 --hook 40-libseen arm
+  expect_rc 0 'arm of the self-firing session exits 0'
+  if ! waits_for 15 has_marker "$(session_dir libfire)/ROLLED_BACK"; then
+    bad 'the watchdog never fired'
+    dump_log libfire
+    return 0
+  fi
+  ok 'the watchdog fired on its own'
+  expect_log libfire 'hook 40-libseen: restore ok' 'the detached watchdog saw it too'
+  session_state_is libfire rolled-back &&
+    ok 'state is rolled-back' || bad 'a rollback in the watchdog left the session open'
 }
 
 test_expiry_rolls_back_newest_first() {
@@ -845,6 +899,8 @@ test_usage_errors
 test_help_and_hooks
 test_shellcheck_if_present
 test_arm_captures_snapshots
+test_options_reach_the_hook
+test_hooks_see_the_library_in_every_process
 test_dry_run_prints_privileged_commands
 test_positional_id_is_accepted
 test_confirm_stops_the_switch

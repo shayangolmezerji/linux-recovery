@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Test fixture hook whose only job is the environment a hook may count on.
+# DEADMAN_LIB has to reach it from every process that runs a hook: the arm, a
+# rollback started by a separate invocation, and the detached watchdog. The
+# library is what gives a hook dm_priv, so a missing variable is a hook that
+# cannot do its work, and this fixture says so with a failure instead of a
+# silent fallback.
+set -euo pipefail
+
+name=40-libseen
+action=${1:-}
+snap=${2:-}
+printf '%s %s\n' "$action" "$name" >>"${DM_TEST_TRACE:?harness must set DM_TEST_TRACE}"
+
+case $action in
+save)
+  printf 'DEADMAN_LIB=%s\n' "${DEADMAN_LIB:?a hook must be able to find the library}" >"$snap/note"
+  ;;
+restore)
+  [[ -s $snap/note ]] || { printf 'libseen: no snapshot\n' >&2; exit 1; }
+  [[ -n ${DEADMAN_LIB:-} ]] || { printf 'libseen: DEADMAN_LIB never reached the restore\n' >&2; exit 1; }
+  [[ -r $DEADMAN_LIB/deadman-lib.sh ]] || {
+    printf 'libseen: %s is not readable\n' "$DEADMAN_LIB/deadman-lib.sh" >&2
+    exit 1
+  }
+  printf 'libseen restored\n'
+  ;;
+*) exit 64 ;;
+esac
