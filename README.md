@@ -631,9 +631,11 @@ real SSH session, and `shellcheck` has never run on this machine.
   watchdog, and a `recover` started after a boot, cannot answer a password
   prompt. It is also a passwordless path from your own account to
   `nft flush ruleset`, open to anything running as that user, switch armed or
-  not, and it is still in place after you purge the session. Nothing here takes
-  it back, so keep it the size of the hooks that need it: see
-  [Sudoers](#sudoers).
+  not, and it is still in place after you purge the session. The `nft -f`
+  entry names a path, not the contents of the file sitting at it, so
+  anything running as you can put a ruleset of its own in that snapshot and
+  have root load it. Nothing here takes it back, so keep it the size of the
+  hooks that need it: see [Sudoers](#sudoers).
 - **A change that breaks something a hook does not cover.** The switch restores
   what the hooks captured. A wrong route with no route hook rolls back nothing.
 - **A machine that stays up but is wedged.** Liveness of the SSH socket is not
