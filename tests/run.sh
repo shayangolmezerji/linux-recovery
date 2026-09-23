@@ -486,6 +486,57 @@ test_stored_hook_names_are_contained_at_recover() {
   expect_rc 0 'cleanup disarm --purge'
 }
 
+# The state file decides the hook directory as well as the names inside it, and
+# that is the value which says where those names are looked up: hook_is_contained
+# checks a stored name against whatever the directory currently claims to be, so
+# a name and a directory read back together pass the check however hostile the
+# pair is. Editing the state file means already owning the arming user's 0700
+# directory, so this is the same boundary the stored name is checked at, and it
+# is pinned for the readers that have nobody's environment in front of them:
+# `recover` after a boot, and any watchdog a unit starts.
+test_stored_hooks_dir_cannot_move_the_rollback() {
+  section 'a stored hooks_dir is pinned to the directory this run resolves'
+  local dir=$WORK/pinned-hooks planted=$WORK/pinned-planted file line tmp
+  mkdir -p "$dir" "$planted"
+  cp "$FIXTURE_HOOKS/50-alpha" "$dir/50-alpha"
+  cp "$FIXTURE_HOOKS/50-alpha" "$planted/50-alpha"
+  : >"$TRACE"
+
+  run_with_env "DEADMAN_HOOKS_DIR=$dir" --id pinned --ttl 600 --hook 50-alpha arm
+  expect_rc 0 'the session under test arms'
+  kill_watchdog pinned || return 0
+
+  # The rewrite stands for a file edited after the arm. The directory it names
+  # holds a working hook, so nothing but the pin keeps the rollback there.
+  file=$(session_dir pinned)/state
+  tmp=$file.tmp
+  while IFS= read -r line; do
+    [[ $line == hooks_dir=* ]] && line="hooks_dir=$planted"
+    printf '%s\n' "$line"
+  done <"$file" >"$tmp"
+  mv "$tmp" "$file"
+
+  # No hook directory in this invocation's environment, so the only one the
+  # rollback may use is the one next to the binary, and 50-alpha is not in it.
+  RC=0
+  OUT=$(env -u DEADMAN_HOOKS_DIR "$DM" --id pinned rollback --reason unpinned 2>&1) || RC=$?
+  expect_rc 1 'a rollback with nothing named reports the hook it could not find'
+  expect_out "ignoring stored hooks_dir $planted" 'the stored directory is named as ignored'
+  expect_out 'hook 50-alpha is gone from' 'and the refusal names the directory searched'
+  expect_no_trace 'restore 50-alpha' 'the hook under the stored directory never ran'
+  session_state_is pinned rollback-failed &&
+    ok 'and the session is not marked restored' ||
+    bad 'a rollback that ignored hooks_dir left the session looking restored'
+
+  # The other half, and the reason the pin is not a ban: naming the directory is
+  # how a session armed outside the tree is rolled back at all.
+  run_with_env "DEADMAN_HOOKS_DIR=$dir" --id pinned rollback --reason pinned
+  expect_rc 4 'a rollback that was told where the hooks live restores them'
+  expect_trace 'restore 50-alpha' 'and the hook was run by that rollback'
+  run --id pinned disarm --purge
+  expect_rc 0 'cleanup disarm --purge'
+}
+
 test_help_and_hooks() {
   section 'help and hook listing'
   run --help
@@ -1049,6 +1100,7 @@ note "scratch state: $WORK"
 test_usage_errors
 test_hook_names_cannot_escape_the_directory
 test_stored_hook_names_are_contained_at_recover
+test_stored_hooks_dir_cannot_move_the_rollback
 test_help_and_hooks
 test_shellcheck_if_present
 test_arm_captures_snapshots

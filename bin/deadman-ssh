@@ -14,6 +14,13 @@ DM_ROOT=$(dirname "$(dirname "$DM_SELF")")
 : "${DEADMAN_LIB:=$DM_ROOT/lib}"
 # shellcheck source=lib/deadman-lib.sh
 . "$DEADMAN_LIB/deadman-lib.sh"
+# Settled before the default fills the variable in, because a later reader of a
+# session file has to be able to tell this build's own hook directory from one an
+# operator named for the run: session_export_env gets a directory back out of
+# disk, and that directory is where the rollback then looks for files to run.
+DM_HOOKS_DIR_DEFAULT=$DM_ROOT/hooks.d
+DM_HOOKS_DIR_FROM_ENV=0
+[[ -z ${DEADMAN_HOOKS_DIR:-} ]] || DM_HOOKS_DIR_FROM_ENV=1
 : "${DEADMAN_HOOKS_DIR:=$DM_ROOT/hooks.d}"
 
 # Defaults for the options below. --ttl 300s is deliberately short: long enough
@@ -116,6 +123,18 @@ session_pid_of() {
 # A session carries how it wants to be run. After a reboot the watchdog has to
 # be restarted by a shell that shares no environment with the one that armed
 # the switch, so dry-run, runner and hook directory come from the state file.
+#
+# The hook directory is the exception to that, because it is the only one of
+# those three whose value names files this process then runs. dry_run and the
+# runner can only make a rollback print or fail, a directory can point it
+# somewhere else. The state directory is 0700, so a value that got changed here
+# was changed by the arming user or by something running as them, which is the
+# same limit the stored hook name has; what the pin buys is that the readers with
+# nobody's environment in front of them, `recover` after a boot and a watchdog
+# started by a unit, can never be sent to a directory by the file. Such a reader
+# restores from this build's own directory and says that it ignored the stored
+# one. An operator who named a directory for the run is trusted with it, since
+# that is the only way a session armed outside this tree gets rolled back.
 session_export_env() {
   local file="$1" value
   value=$(dm_state_get "$file" dry_run) || value=''
@@ -123,7 +142,13 @@ session_export_env() {
   value=$(dm_state_get "$file" runner) || value=''
   [[ -n $value ]] && export DEADMAN_RUNNER="$value"
   value=$(dm_state_get "$file" hooks_dir) || value=''
-  [[ -n $value ]] && export DEADMAN_HOOKS_DIR="$value"
+  if [[ -n $value ]]; then
+    if [[ $value == "$DM_HOOKS_DIR_DEFAULT" ]] || (($DM_HOOKS_DIR_FROM_ENV)); then
+      export DEADMAN_HOOKS_DIR="$value"
+    else
+      dm_warn "ignoring stored hooks_dir $value, restoring from $DEADMAN_HOOKS_DIR"
+    fi
+  fi
   value=$(dm_state_get "$file" state_dir) || value=''
   [[ -n $value ]] && export DEADMAN_STATE_DIR="$value"
   return 0
