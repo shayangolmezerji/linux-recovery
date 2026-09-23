@@ -342,6 +342,20 @@ test_usage_errors() {
   expect_rc 2 'a negative grace exits 2'
   run --id bad --opt valuewithoutkey arm
   expect_rc 2 '--opt without = exits 2'
+  # The key is the half of the option that becomes a variable name, so it is
+  # asked here rather than by export, which answers an invalid identifier with a
+  # shell error and an arm that exits 1.
+  run --id optkey --opt 'bad-key=1' arm
+  expect_rc 2 'an --opt key that is not a variable name exits 2'
+  expect_out "--opt key 'bad-key' must be letters" 'and the refusal names the key'
+  expect_no_file "$(session_dir optkey)" 'the refused --opt armed nothing'
+  run --id optline --opt $'a\nb=1' arm
+  expect_rc 2 'an --opt key spanning a line is refused too'
+  expect_no_file "$(session_dir optline)" 'and it never reached the export'
+  run --id optgood --ttl 300 --hook 50-alpha --opt NOTE=ok_1 --opt '_Also=1' arm
+  expect_rc 0 'a key with a digit, an underscore or both is armed with'
+  run --id optgood disarm --purge
+  expect_rc 0 'cleanup disarm --purge'
   run --id bad --hook nosuchhook arm
   expect_rc 2 'an unknown hook name exits 2'
   run --id 'with space' --ttl 300 --hook 50-alpha arm

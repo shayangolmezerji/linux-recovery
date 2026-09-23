@@ -835,7 +835,7 @@ cmd_hooks() {
 
 COMMAND=''
 parse_args() {
-  local operand='' secs
+  local operand='' secs optkey
   while (($#)); do
     case $1 in
     --ttl | --interval | --grace | --id | --hook | --opt | --reason)
@@ -863,6 +863,16 @@ parse_args() {
         ;;
       opt)
         [[ $2 == *=* ]] || die_usage "--opt wants KEY=VALUE, got '$2'"
+        # The key is not a value here, it is half of a variable name: export_opts
+        # hands `export` one word built out of it, and an export of an invalid
+        # identifier is a shell error that aborts the arm with exit 1 and a
+        # message about line numbers. Asking the question of the key in the
+        # parser turns the same typo into a usage error, before a hook has
+        # captured anything.
+        optkey=${2%%=*}
+        [[ $optkey =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] ||
+          die_usage "--opt key '$optkey' must be letters, digits and" \
+            "underscores, starting with a letter or an underscore"
         DM_OPTS+=("$2")
         ;;
       esac

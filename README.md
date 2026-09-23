@@ -508,7 +508,7 @@ rollback and a reconciliation.
 bash tests/run.sh
 ```
 
-26 groups, 229 checks, about 28 seconds: all pass, 1 skipped. Plain
+26 groups, 236 checks, about 28 seconds: all pass, 1 skipped. Plain
 bash and coreutils: the
 box you administer has neither bats nor pytest, and a switch that can only be
 tested on a developer machine is not testable where it runs. `bats` is not
