@@ -731,7 +731,11 @@ test_ipv6_tuple_falls_back_to_the_timer() {
   # accepts dotted-quad only. The dangerous part is not the refusal, it is what a
   # refusal must not be allowed to look like: with --grace 0, reading the session
   # as gone would roll back a live IPv6 operator's box in seconds.
-  local n=0 tuple id
+  #
+  # run_with_ss reads the shared tuple, so the override below is scoped to this
+  # test: left set, every later socket case would arm with an IPv6 peer and
+  # silently exercise the fallback instead of the probe.
+  local n=0 tuple id saved_tuple=$SS_TUPLE
   for tuple in '[2001:db8::1] 45455 192.0.2.2 22' '2001:db8::1 45455 192.0.2.2 22'; do
     n=$((n + 1))
     id="ipv6-$n"
@@ -759,6 +763,7 @@ test_ipv6_tuple_falls_back_to_the_timer() {
   expect_rc 0 'cleanup disarm of the first'
   run --id ipv6-2 disarm
   expect_rc 0 'cleanup disarm of the second'
+  SS_TUPLE=$saved_tuple
   printf '%s\n' "${SS_ROWS[0]}" >"$SSTABLE"
 }
 
