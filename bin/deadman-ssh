@@ -182,6 +182,10 @@ run_hook() {
   local action="$1" hook="$2" snap="$3" name rc=0
   name=$(basename "$hook")
   mkdir -p "$snap"
+  # Every hook runs here, in whichever process reached it: the arm, a rollback
+  # typed later, the watchdog, or recover. Export the library at the call, not
+  # at the arm, or a hook that cannot find dm_priv fails at restore time.
+  export DEADMAN_LIB
   "$hook" "$action" "$snap" || rc=$?
   case $rc in
   0) dm_log "hook $name: $action ok" ;;
@@ -373,7 +377,6 @@ cmd_arm() {
   resolve_hooks
   ((${#DM_HOOK_PATHS[@]} > 0)) || die_usage "no hooks found in $DEADMAN_HOOKS_DIR"
 
-  export DEADMAN_LIB
   export_opts
   probe=$(pick_probe)
 

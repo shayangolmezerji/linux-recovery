@@ -95,11 +95,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Fatal on purpose, and red on main until a known fix lands. Two checks
-      # fail: DEADMAN_LIB is exported by the arm process only, so a hook that
-      # cannot derive the library from its own location fails at the moment it
-      # is asked to restore. That is a defect in the switch, reported rather
-      # than worked around. See "Known defect" in README.md. Making this step
-      # non-fatal would be the wrong way to get a green check mark.
+      # Fatal on purpose: this suite is the only evidence a rollback can still
+      # run end to end, so a green check mark here has to mean something.
       - name: Test suite
         run: bash tests/run.sh

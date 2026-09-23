@@ -274,12 +274,12 @@ a `rollback` you type later are separate processes that never saw the option,
 so a hook that needs an option at restore time must write its effect into the
 snapshot. That is what `50-alpha` in the fixtures is set up to prove.
 
-`DEADMAN_LIB` reaches a hook the same way: reliably from the arm, not yet from
-the other two processes. `20-nftables` survives this because it derives the
-path from its own location as a fallback, and `hooks.d/` sits next to `lib/` in
-a checkout. A hook installed anywhere else has to do the same, or it cannot
-find `dm_priv` when it matters. Two checks in `bash tests/run.sh` are red about
-this and are documented under [Limitations](#limitations).
+`DEADMAN_LIB`, by contrast, reaches every hook: `run_hook` exports it just
+before invoking one, so the arm, a `rollback` you type later, the detached
+watchdog and `recover` after a reboot all hand a hook the library.
+`20-nftables` still derives the path from its own location as a fallback, so a
+hook installed somewhere unusual keeps finding `dm_priv` even if that export
+were ever removed. The `Testing` section covers each of those four processes.
 
 ### An example
 
@@ -384,7 +384,7 @@ rollback and a reconciliation.
 bash tests/run.sh
 ```
 
-24 groups, 194 checks, about 26 seconds: 192 pass, 2 fail, 1 skipped. Plain
+24 groups, 201 checks, about 29 seconds: all pass, 1 skipped. Plain
 bash and coreutils: the
 box you administer has neither bats nor pytest, and a switch that can only be
 tested on a developer machine is not testable where it runs. `bats` is not
@@ -405,19 +405,12 @@ started and checked against `/proc/<pid>/cmdline` first. One group runs the
 host's own `ss`, read-only, to check that a session it cannot match degrades to
 the timer; it passes whichever way that goes.
 
-Two checks are red, in the group `DEADMAN_LIB reaches a hook in every process
-that runs one`:
-
-```
-  FAIL a rollback from a second process exits 4: expected rc 4, got 1
-  FAIL and the hook found the library there: output did not contain: hook 40-libseen: restore ok
-```
-
-They are left red rather than fixed, because the defect they name is in the
-switch and the fix changes behaviour. `DEADMAN_LIB` is exported by `cmd_arm`
-and by nothing else, so a hook that cannot derive the library from its own
-location fails at restore, which is the one moment it matters. A watchdog
-started by `recover` has the same problem, and no test covers it. Details under
+The group `DEADMAN_LIB reaches a hook in every process that runs one` was for a
+while the honest red in this suite: it asserted a fix that had not landed.
+`run_hook` now exports the library at the call, so the arm, a `rollback` typed
+from a second process, the self-firing watchdog, and `recover` after a simulated
+reboot each hand a hook a sourceable `deadman-lib.sh`, and all four checks pass.
+See "The library reaches every process that runs a hook" under
 [Limitations](#limitations).
 
 ## Limitations
@@ -455,30 +448,23 @@ including restarting a watchdog.
 | `shellcheck` | Not installed on this machine and not installable without root. The lint gate exists in CI and has never run anything here. `bash -n` passes on every file, and `bash -n` is a syntax check only. |
 | GitHub Actions | `.github/workflows/ci.yml` has never been executed by GitHub. |
 
-### Known defect: the library does not reach every process that runs a hook
+### The library reaches every process that runs a hook
 
-`DEADMAN_LIB` is exported inside `cmd_arm` and nowhere else, so the three
-processes that invoke a hook are not equivalent:
+`DEADMAN_LIB` is exported by `run_hook`, the one function through which every
+hook is invoked, so the four processes that reach a hook are now equivalent:
+the arm, the watchdog that fires on its own, a `rollback` typed from a second
+process, and `recover` running a restore after a reboot.
 
-| Process | Hook can source the library |
-|---|---|
-| `arm` | yes, it exports the variable |
-| `watch` started by that arm | yes, by inheritance from the arm |
-| `rollback` typed by an operator | no |
-| `watch` started by `recover` | no |
+This closed a real defect. The variable used to be exported only inside
+`cmd_arm`, so a hook that could not derive the library from its own location
+(which `hooks.d` next to `lib` can, and which a directory of your own, the case
+`DEADMAN_HOOKS_DIR` exists for, cannot) reached `restore` with `DEADMAN_LIB`
+empty and sourced no `dm_priv`. The failure was in the switch, not the hook.
+`tests/run.sh` now asserts the guarantee for all four processes, the `recover`
+reboot row included.
 
-The last row is the one that matters: after a reboot the arm is long gone, and
-the watchdog `recover` starts is the process that performs the restore. A hook
-that sits in `hooks.d` next to `lib` is fine, because it derives the path from
-its own location. A hook in a directory of your own, which is what
-`DEADMAN_HOOKS_DIR` is for, gets `DEADMAN_LIB` empty and sources nothing. The
-two red checks in `Testing` reproduce the `rollback` row; nothing reproduces
-the `recover` row yet.
-
-The fix is one line, exporting the variable where a hook is about to be run
-rather than where the arm happened to be, and it is not in this pass because
-exporting it changes behaviour and the change should be reviewed on its own
-merit, not smuggled in with documentation.
+None of that changes the table above: no run here uses root, a live `nft`, or a
+real SSH session, and `shellcheck` has never run on this machine.
 
 ### What is not protected against
 

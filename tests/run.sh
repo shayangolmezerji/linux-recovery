@@ -426,7 +426,9 @@ test_options_reach_the_hook() {
 # Two of the three hook invocations happen in a process that never parsed the
 # arm's arguments: `rollback` from an operator typing it, and the detached
 # `watch` that fires on its own. Both have to hand a hook the library anyway, or
-# the rollback a hook exists to perform is the one thing it cannot do.
+# the rollback a hook exists to perform is the one thing it cannot do. The
+# recover path is the fourth: after a reboot the arm is gone and `recover` runs
+# the restore itself, in a process that never exported anything.
 test_hooks_see_the_library_in_every_process() {
   section 'DEADMAN_LIB reaches a hook in every process that runs one'
   : >"$TRACE"
@@ -451,6 +453,24 @@ test_hooks_see_the_library_in_every_process() {
   expect_log libfire 'hook 40-libseen: restore ok' 'the detached watchdog saw it too'
   session_state_is libfire rolled-back &&
     ok 'state is rolled-back' || bad 'a rollback in the watchdog left the session open'
+  run --id libfire disarm --purge
+  expect_rc 0 'cleanup disarm --purge'
+
+  # The reboot branch of recover: the restore runs in the recover process, which
+  # never saw the arm's environment, so this is the row the arm-time export
+  # never covered.
+  run --id libreboot --ttl 600 --hook 40-libseen arm
+  expect_rc 0 'arm of the recover session exits 0'
+  kill_watchdog libreboot || return 0
+  printf 'boot-after-reboot\n' >"$BOOTID"
+  run --id libreboot recover
+  expect_rc 0 'recover exits 0'
+  expect_out 'hook 40-libseen: restore ok' 'recover handed the hook the library too'
+  session_state_is libreboot rolled-back &&
+    ok 'the recovered session is rolled-back' || bad 'recover did not finish the restore'
+  printf 'boot-under-test\n' >"$BOOTID"
+  run --id libreboot disarm --purge
+  expect_rc 0 'cleanup disarm --purge'
 }
 
 test_expiry_rolls_back_newest_first() {
