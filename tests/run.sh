@@ -1076,6 +1076,10 @@ test_payload_failure_rolls_back_at_once() {
   expect_reason payload payload-failed 'the marker names the reason'
 }
 
+# Stricter than the lint job's gate on purpose. That gate is the floor a change
+# clears before anyone has read a report, so it holds at the severity this repo
+# has seen pass; this is where the report gets read, so it asks for the one that
+# caught a real defect here.
 test_shellcheck_if_present() {
   section 'shellcheck on every script'
   if ! command -v shellcheck >/dev/null 2>&1; then
