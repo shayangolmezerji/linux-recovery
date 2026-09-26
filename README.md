@@ -540,6 +540,29 @@ started and checked against `/proc/<pid>/cmdline` first. One group runs the
 host's own `ss`, read-only, to check that a session it cannot match degrades to
 the timer; it passes whichever way that goes.
 
+The group that interrupts a capture does not send a fixed signal. A script with
+no job control starts a background job with `SIGINT` ignored, and bash refuses
+to install a handler for a signal its process entered that way, so an `arm`
+launched by such a script catches `SIGTERM` and nothing else, while the same
+`arm` launched in the foreground catches both. The harness reads `SigCgt` out of
+`/proc/<pid>/status` for the process it started, signals whichever of the two
+that mask says is catching, and prints which one it chose. A foreground run of
+`bash tests/run.sh` here prints `arm catches SIGINT`; three runs of the same
+file launched with `&` print `arm catches SIGTERM`. All four print `246 checks
+passed, 0 failed`, because both names reach the same handler and the same abort
+path. Before that it waited on a fixed delay, and that delay lost the group from
+the other side, by signalling an arm whose trap had not been installed yet.
+
+The wait is two-way. The harness polls for the trace line the slow fixture hook
+writes when it enters, and that hook then stays in its `save` until the harness
+creates a file saying the signal has been dispatched, bounded at twenty seconds
+and failing loudly if it never appears. The reason is bash runs a trap only once
+the child it was waiting on has returned, so the arm's abort point is wherever
+that hook ends and not wherever the kill was sent. One-way waiting left a window
+two seconds wide for the harness to notice, and three concurrent copies of the
+suite missed it every time: the group was red on all eight of its checks, at
+`rc 0`, with the payload run and the change applied.
+
 The group `DEADMAN_LIB reaches a hook in every process that runs one` was for a
 while the honest red in this suite: it asserted a fix that had not landed.
 `run_hook` now exports the library at the call, so the arm, a `rollback` typed
@@ -660,6 +683,16 @@ live `nft`, or a real SSH session.
   anything running as you can put a ruleset of its own in that snapshot and
   have root load it. Nothing here takes it back, so keep it the size of the
   hooks that need it: see [Sudoers](#sudoers).
+- **A Ctrl-C on an arm started by a script.** `arm` traps `INT` and `TERM`, but
+  bash will not install a handler for a signal its process entered ignored, and
+  a shell with no job control starts background jobs with `INT` ignored. A
+  two-line script on this box, `trap ... INT TERM` over `sleep 3`, ran to
+  completion with no output when `kill -INT` was sent to it behind a `&`, and
+  printed from its handler with exit 1 when the same signal was sent as `TERM`.
+  So an arm you background from a script does not abort on Ctrl-C: the capture
+  finishes, the change lands, and the rollback is left to the watchdog. Send
+  `kill -TERM` to that pid. The suite covers both dispositions and signals
+  whichever the arm it started is actually catching, so neither path is untested.
 - **A change that breaks something a hook does not cover.** The switch restores
   what the hooks captured. A wrong route with no route hook rolls back nothing.
 - **A machine that stays up but is wedged.** Liveness of the SSH socket is not
