@@ -599,13 +599,16 @@ Two rows have left the table above, because the two things they named have run
 since. `shellcheck` 0.11.0 ran on this box, taken out of the
 `koalaman/shellcheck:stable` image and put on `PATH` by hand, and it is not on
 `PATH` by default, so a plain `bash tests/run.sh` here still prints the skip
-notes and 246 rather than 256. `.github/workflows/ci.yml` has run four times on
-GitHub and two of them went red: `main` at `bccca9b` and a Dependabot PR on
-2026-09-23, each failing the suite's own lint check (`FAIL shellcheck: run.sh`,
-SC2155, `255 checks passed, 1 FAILED`), the defect `8a5f27d` fixed. `main` at
-`5203796` and `606fa6f` passed on 2026-09-26, run `36256984496` printing
-`256 checks passed, 0 failed`. `bash -n` is still a syntax check and nothing
-more, and its job has been green in all four.
+notes and 246 rather than 256. `.github/workflows/ci.yml` has run on GitHub
+through 2026-09-26, and those runs are named by id rather than counted, because
+the next push adds one. Run `35934781246` (`main` at `bccca9b`) and run
+`35934864372` (a Dependabot PR) went red on 2026-09-23, each failing the
+suite's own lint check (`FAIL shellcheck: run.sh`, SC2155,
+`255 checks passed, 1 FAILED`), the defect `8a5f27d` fixed. Run `36256468976`
+(`main` at `5203796`) and run `36256984496` (`main` at `606fa6f`) passed on
+2026-09-26, each printing `256 checks passed, 0 failed`. The lint job's own
+gate, `--severity=error`, failed none of those runs. `bash -n` is still a
+syntax check and nothing more, and its job is green in each run named above.
 
 None of that puts a run behind the rest of the table: no run here uses root, a
 live `nft`, or a real SSH session.

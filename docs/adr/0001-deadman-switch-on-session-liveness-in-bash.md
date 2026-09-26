@@ -126,11 +126,21 @@ The costs, named rather than argued away:
   deliberate `|| rc=$?` at the places that must keep going (`run_hook`,
   `do_rollback`) is the whole story, and one missing `|| rc=$?` turns a
   continued rollback into an aborted one.
-- **No lint ran here.** `shellcheck` is not installed and cannot be installed
-  without root, so quoting and word-splitting bugs of exactly the class
-  shellcheck exists to catch are unverified locally. `bash -n` checks syntax
-  and nothing else. CI is the first place this gets a real lint pass, and that
-  workflow has never been run.
+- **No lint ran here when this was decided.** `shellcheck` was not installed
+  and could not be installed without root, so quoting and word-splitting bugs
+  of exactly the class shellcheck exists to catch were unverified locally, and
+  `bash -n` checked syntax and nothing else. That is no longer the state of the
+  evidence. GitHub Actions has run the lint job on 0.9.0 from apt, on every
+  push to `main` through 2026-09-26 and on one Dependabot PR. The job's gate is
+  `--severity=error` and has failed no build; what went red was this suite's
+  own warning-level check, `FAIL shellcheck: run.sh` on SC2155, in runs
+  `35934781246` (`main` at `bccca9b`) and `35934864372`. The job's non-fatal
+  warning report printed the same finding beside them, and both checks were
+  green from `36256468976` after `8a5f27d` moved the assignment out of the
+  `local`. Locally, 0.11.0 taken out of the `koalaman/shellcheck:stable` image
+  and put on `PATH` by hand reports nothing at `--severity=warning` across the
+  eleven files the lint job's loop lists. What has not changed: no package
+  installs here, and a local lint still rests on a binary placed by hand.
 - **The harness is hand-rolled.** No bats, no pytest, so ordering assertions
   ("beta restored before alpha") are grep on a trace file with line numbers.
   Cheap, but it has none of the structure a test framework would give.
