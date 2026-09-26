@@ -632,8 +632,11 @@ the next push adds one. Run `35934781246` (`main` at `bccca9b`) and run
 `35934864372` (a Dependabot PR) went red on 2026-09-23, each failing the
 suite's own lint check (`FAIL shellcheck: run.sh`, SC2155,
 `255 checks passed, 1 FAILED`), the defect `8a5f27d` fixed. Run `36256468976`
-(`main` at `5203796`) and run `36256984496` (`main` at `606fa6f`) passed on
-2026-09-26, each printing `256 checks passed, 0 failed`. The lint job's own
+(`main` at `5203796`), run `36256984496` (`main` at `606fa6f`) and run
+`36269987507` (`main` at `d816c8f`) passed on 2026-09-26, each printing
+`256 checks passed, 0 failed`. The last is the first to run the interrupt
+group's signal choice on a runner, and there the arm caught `SIGINT`, the same
+disposition a foreground run here reports. The lint job's own
 gate, `--severity=error`, failed none of those runs. `bash -n` is still a
 syntax check and nothing more, and its job is green in each run named above.
 
