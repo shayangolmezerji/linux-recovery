@@ -641,7 +641,10 @@ disposition a foreground run here reports. The lint job's gate was
 `--severity=warning`, the level `tests/run.sh` uses when the binary is on `PATH`
 here. The report at that level had gone quiet, its one finding being the SC2155
 `8a5f27d` fixed, and the advisory step that produced it went away with the
-threshold change rather than surviving it. `bash -n` is still a
+threshold change rather than surviving it. Run `36271360476` (`main` at
+`f42d87e`) is that gate's first run, and it is green: the step the runner logged
+is `shellcheck --severity=warning "$file"`, over the same eleven paths, on the
+0.9.0 apt installs. `bash -n` is still a
 syntax check and nothing more, and its job is green in each run named above.
 
 None of that puts a run behind the rest of the table: no run here uses root, a
