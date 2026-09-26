@@ -636,8 +636,12 @@ suite's own lint check (`FAIL shellcheck: run.sh`, SC2155,
 `36269987507` (`main` at `d816c8f`) passed on 2026-09-26, each printing
 `256 checks passed, 0 failed`. The last is the first to run the interrupt
 group's signal choice on a runner, and there the arm caught `SIGINT`, the same
-disposition a foreground run here reports. The lint job's own
-gate, `--severity=error`, failed none of those runs. `bash -n` is still a
+disposition a foreground run here reports. The lint job's gate was
+`--severity=error` for every run named above, and it now stops at
+`--severity=warning`, the level `tests/run.sh` uses when the binary is on `PATH`
+here. The report at that level had gone quiet, its one finding being the SC2155
+`8a5f27d` fixed, and the advisory step that produced it went away with the
+threshold change rather than surviving it. `bash -n` is still a
 syntax check and nothing more, and its job is green in each run named above.
 
 None of that puts a run behind the rest of the table: no run here uses root, a

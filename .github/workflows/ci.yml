@@ -42,35 +42,25 @@ jobs:
           sudo apt-get install -y shellcheck
           shellcheck --version
 
-      # Gate: --severity=error. That level carries the bugs that break a
-      # rollback, quoting and expansion mostly. When this was written, nothing
-      # had checked this tree at any level; the gate has run on every CI run
-      # through 2026-09-26 and has claimed no file on any of them.
+      # Gate: --severity=warning, the level tests/run.sh uses locally when the
+      # binary is on PATH.
       #
-      # The warning level is reported by the next step instead of gating, and
-      # tests/run.sh uses --severity=warning when the tool is present locally.
-      # The two thresholds were deliberately different until someone read the
-      # warning report: an unverified threshold should not be what turns main
-      # red, and a gate nobody has seen pass is not a gate. It has been read,
-      # on those same runs. SC2155 in tests/run.sh is the only finding the
-      # report has made, and it came from the runs of 2026-09-23 that predate
-      # 8a5f27d; the runs since then report nothing, and neither does
-      # tests/run.sh on this machine now that 0.11.0 is on PATH. Raising
-      # this gate to warning and deleting the report step is the step that
-      # follows from that, and this file has not taken it.
+      # It started at --severity=error, with a second non-fatal step reporting
+      # the warning level, because an unverified threshold should not be what
+      # turns main red and a gate nobody has seen pass is not a gate. Both
+      # halves have been read since. The error gate claimed no file on any run
+      # through 2026-09-26. The warning report made exactly one finding across
+      # all of them, SC2155 in tests/run.sh, on the runs of 2026-09-23 that
+      # predate 8a5f27d, and nothing on the runner has printed one since. The
+      # loop below was then run at warning over all eleven paths with 0.11.0 on
+      # PATH here, clean, which is what turned raising the threshold into a
+      # change rather than a guess.
+      #
+      # The report step went with it. Two steps over the same files, one of them
+      # advisory, existed to learn what the stricter gate would cost. That is
+      # known now, and an advisory step nobody is obliged to read is how the
+      # old threshold stayed unverified for as long as it did.
       - name: shellcheck, gates the build
-        run: |
-          set -euo pipefail
-          for file in bin/deadman-ssh lib/deadman-lib.sh hooks.d/* \
-                      tests/run.sh tests/fixtures/bin/ss \
-                      tests/fixtures/hooks.d/*; do
-            shellcheck --severity=error "$file"
-          done
-
-      # Non-fatal, and not a substitute for the gate above. Its whole job is to
-      # be read once and turned into either a fix or a threshold change.
-      - name: shellcheck, reports only
-        continue-on-error: true
         run: |
           set -euo pipefail
           for file in bin/deadman-ssh lib/deadman-lib.sh hooks.d/* \
