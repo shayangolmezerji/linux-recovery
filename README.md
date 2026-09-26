@@ -508,14 +508,20 @@ rollback and a reconciliation.
 bash tests/run.sh
 ```
 
-27 groups, 246 checks, about 28 seconds: all pass, 1 skipped. Plain
-bash and coreutils: the
+27 groups, all passing, on both sides of one condition: how many checks that
+is depends on whether `shellcheck` is on `PATH`. Without it the lint group
+reports a single skip and the run is 246 checks in about 34 seconds; with it
+the same group lints ten files and the run is 256 checks in about 46 seconds.
+Both figures come from this box today, the second from the same binary
+temporarily put on `PATH`, since nothing here installs packages. The CI suite
+job is the one that sees 256.
+
+Plain bash and coreutils: the
 box you administer has neither bats nor pytest, and a switch that can only be
 tested on a developer machine is not testable where it runs. `bats` is not
 installed here and is not used, which is a deliberate deviation from the plan
 this repo came out of: a second scripting language would be a dependency the
-tool itself does not need. The skipped check is `shellcheck`, which this
-machine does not have and cannot install.
+tool itself does not need.
 
 The harness runs the real CLI with `DEADMAN_DRY_RUN=1`, a scratch state
 directory under `$TMPDIR`, `hooks.d` pointed at fixtures, `DEADMAN_RUNNER`
