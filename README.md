@@ -510,8 +510,9 @@ bash tests/run.sh
 
 27 groups, all passing, on both sides of one condition: how many checks that
 is depends on whether `shellcheck` is on `PATH`. Without it the lint group
-reports a single skip and the run is 246 checks in about 34 seconds; with it
-the same group lints ten files and the run is 256 checks in about 46 seconds.
+prints two skip notes, lints no file, and the run is 246 checks in about 34
+seconds; with it the same group lints ten files and the run is 256 checks in
+about 46 seconds.
 Both figures come from this box today, the second from the same binary
 temporarily put on `PATH`, since nothing here installs packages. The CI suite
 job is the one that sees 256.
@@ -578,8 +579,6 @@ including restarting a watchdog.
 | Rollback after a reboot with an escalated runner | `recover` is tested with `DEADMAN_RUNNER=false` and dry-run on. The real version needs sudo to still work unattended after a boot. |
 | Two operators arming the same id | The mkdir lock makes the second arm lose, which is tested for one process at a time. Nothing here proves it against a genuine race. |
 | Concurrent rollback from `watch` and `recover` | Both check for a `ROLLED_BACK` marker before firing. That guard is read from the code, not from a test that runs them against each other. |
-| `shellcheck` | Not installed on this machine and not installable without root. The lint gate exists in CI and has never run anything here. `bash -n` passes on every file, and `bash -n` is a syntax check only. |
-| GitHub Actions | `.github/workflows/ci.yml` has never been executed by GitHub. |
 
 ### The library reaches every process that runs a hook
 
@@ -596,8 +595,20 @@ empty and sourced no `dm_priv`. The failure was in the switch, not the hook.
 `tests/run.sh` now asserts the guarantee for all four processes, the `recover`
 reboot row included.
 
-None of that changes the table above: no run here uses root, a live `nft`, or a
-real SSH session, and `shellcheck` has never run on this machine.
+Two rows have left the table above, because the two things they named have run
+since. `shellcheck` 0.11.0 ran on this box, taken out of the
+`koalaman/shellcheck:stable` image and put on `PATH` by hand, and it is not on
+`PATH` by default, so a plain `bash tests/run.sh` here still prints the skip
+notes and 246 rather than 256. `.github/workflows/ci.yml` has run four times on
+GitHub and two of them went red: `main` at `bccca9b` and a Dependabot PR on
+2026-09-23, each failing the suite's own lint check (`FAIL shellcheck: run.sh`,
+SC2155, `255 checks passed, 1 FAILED`), the defect `8a5f27d` fixed. `main` at
+`5203796` and `606fa6f` passed on 2026-09-26, run `36256984496` printing
+`256 checks passed, 0 failed`. `bash -n` is still a syntax check and nothing
+more, and its job has been green in all four.
+
+None of that puts a run behind the rest of the table: no run here uses root, a
+live `nft`, or a real SSH session.
 
 ### What is not protected against
 
