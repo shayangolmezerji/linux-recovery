@@ -2,16 +2,46 @@
 # Test fixture hook that is slow to capture, so the harness can interrupt an arm
 # between the first snapshot and the second. Its save never finishes, which is
 # what makes it the hook that must not be restored.
+#
+# The trace line this writes on entry is what the interrupt test waits on to
+# learn the arm is inside that window, so it has to stay before the sleep.
 set -euo pipefail
 
 name=80-slowsave
 action=${1:-}
 snap=${2:-}
+handshake_limit=20
 printf '%s %s\n' "$action" "$name" >>"${DM_TEST_TRACE:?harness must set DM_TEST_TRACE}"
 
 case $action in
 save)
   sleep 2
+  # The other half of the interrupt test's rendezvous. That test waits for the
+  # entry line above and then signals the arm, but bash defers a signal received
+  # while it waits on a foreground child until that child is done, so the arm's
+  # abort point is wherever this save returns and not wherever the kill is: a poll
+  # loop starved past the sleep wakes to an arm that has already left the capture
+  # loop, and there is nothing left to interrupt. So stay here until the test has
+  # dispatched the signal, which it says so by creating the file named in the
+  # environment, after its kill() returns. Bounded, because a test that dies
+  # before creating that file must fail the suite loudly rather than hang it.
+  #
+  # Only the interrupt test exports that variable, which is what keeps this wait
+  # out of every other use of this fixture: a group that is here for the two
+  # seconds and never signals anything would otherwise sit in the loop below and
+  # then be reported as a failed capture.
+  if [[ -n ${DM_TEST_INTERRUPT_HANDSHAKE:-} ]]; then
+    waited=0
+    while [[ ! -e $DM_TEST_INTERRUPT_HANDSHAKE ]]; do
+      if ((waited >= handshake_limit * 5)); then
+        printf 'handshake-timeout %s after %ss\n' "$name" "$handshake_limit" >>"$DM_TEST_TRACE"
+        printf '80-slowsave: no interrupt handshake after %ss\n' "$handshake_limit" >&2
+        exit 1
+      fi
+      sleep 0.2
+      waited=$((waited + 1))
+    done
+  fi
   printf 'slow state\n' >"$snap/note"
   ;;
 restore)

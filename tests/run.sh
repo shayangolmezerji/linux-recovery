@@ -783,22 +783,107 @@ test_interrupted_capture_rolls_back() {
   section 'a signal while capturing aborts the arm and restores what was saved'
   : >"$TRACE"
   local arm_out=$WORK/interrupt.out arm_pid
+  local handshake=$WORK/interrupt.signalled gave_up
+  local limit=15 entered=0 tick=0 caught=0 signal=''
   RC=0
-  # Two things have to go right for this to test anything. Dry-run is off, or the
-  # payload would never run and its absence would prove nothing. And job control
-  # is on: a background command of a non-interactive shell inherits SIGINT as
-  # ignored, bash refuses to trap a signal it was entered with ignored, and the
-  # kill below would be swallowed by the arm instead of reaching its trap.
+  # Three things have to go right for this to test anything. Dry-run is off, or the
+  # payload would never run and its absence would prove nothing. Job control is on:
+  # a background command of a non-interactive shell inherits SIGINT as ignored,
+  # bash refuses to trap a signal it was entered with ignored, and the kill below
+  # would be swallowed by the arm instead of reaching its trap. And the kill has to
+  # name a signal the arm is actually catching, because that inheritance is not
+  # always job control's to prevent; see the mask read below.
   set -m
   {
-    env -u DEADMAN_DRY_RUN "$DM" --id interrupt --ttl 300 \
+    env -u DEADMAN_DRY_RUN "DM_TEST_INTERRUPT_HANDSHAKE=$handshake" \
+      "$DM" --id interrupt --ttl 300 \
       --hook 50-alpha --hook 80-slowsave arm -- touch "$WORK/also-not" >"$arm_out" 2>&1 &
     arm_pid=$!
-    sleep 0.5
-    kill -INT "$arm_pid" 2>/dev/null || true
+    # The signal has to land in one window: after the first capture came back, so
+    # there is something to restore, and while the arm is still capturing, so its
+    # trap is still installed. 80-slowsave runs second, so the trace line it writes
+    # on entry is proof that 50-alpha is already recorded as saved. Waiting for that
+    # line is a handshake with the moment; the fixed delay this group used to signal
+    # after was a guess about it, and the guess loses on a busy box, because starting
+    # bash, sourcing the library, writing the state file and running the first
+    # capture can each take longer than the delay.
+    # Polled in hundredths instead of through waits_for, whose tick is a fifth of a
+    # second, because this loop is what releases the hook.
+    while ((tick < limit * 100)); do
+      if grep -qF -- 'save 80-slowsave' "$TRACE" 2>/dev/null; then
+        entered=1
+        break
+      fi
+      sleep 0.01
+      tick=$((tick + 1))
+    done
+    # The marker is only half of a rendezvous. The window closes when the slow hook
+    # returns, and bash defers a signal received while it waits on a foreground
+    # child until that child is done, so the arm's abort point is wherever the hook
+    # finishes and not wherever the kill is: a poll loop starved for longer than the
+    # hook sleeps sends its signal to an arm that has already removed the trap and
+    # committed. So the hook does not return until the file below exists, and the
+    # file is created only after the kill, because kill() returning is what proves
+    # the signal is queued on the arm. Touch the file first and the race is back,
+    # one hundredth of a second wide.
+    if ((entered == 1)); then
+      caught=$(sed -n 's/^SigCgt:[[:space:]]*//p' "/proc/$arm_pid/status") || caught=0
+      # SigCgt is the hex mask of the signals this process is catching: bit 1<<1 is
+      # SIGINT, bit 1<<14 is SIGTERM. The arm traps both with one and the same
+      # handler, so either one landing mid-capture is the behaviour under test, and
+      # INT is preferred because that is what a Ctrl-C in the operator's terminal
+      # looks like. The reason it cannot simply be assumed is that a suite started
+      # as a background job of a non-interactive shell, which is how CI and shell
+      # one-liners run it and how this group gets run under load, is itself entered
+      # with SIGINT ignored and passes that down the whole tree. Job control stops
+      # the arm's own SIGINT being ignored for the sake of the job; nothing in bash
+      # can undo a disposition this process inherited, so on such a run the arm is
+      # listening for TERM alone and a SIGINT here is dropped before it reaches
+      # anybody. That, and not the timing, is why this group used to print eight
+      # failures out of 246.
+      if ((16#$caught & 2)); then
+        signal=INT
+      elif ((16#$caught & 16384)); then
+        signal=TERM
+      fi
+    fi
+    # Sent whether or not the handshake came, because an arm that never got this
+    # far must not be left to run its payload and start a watchdog the group has
+    # stopped checking.
+    kill -"${signal:-INT}" "$arm_pid" 2>/dev/null || true
+    : >"$handshake"
     wait "$arm_pid" || RC=$?
   }
   set +m
+  if ((entered == 0)); then
+    bad "the arm never reached the interrupt window in ${limit}s of polling, so the signal was sent blind"
+    if [[ -s $arm_out ]]; then
+      sed 's/^/       | /' "$arm_out"
+    fi
+    sed 's/^/       | /' "$TRACE"
+    return 0
+  fi
+  if [[ -z $signal ]]; then
+    bad "the arm catches neither SIGINT nor SIGTERM (SigCgt $caught), so no signal reaches its trap"
+    if [[ -s $arm_out ]]; then
+      sed 's/^/       | /' "$arm_out"
+    fi
+    sed 's/^/       | /' "$TRACE"
+    return 0
+  fi
+  # The other half of the bound: a hook that gave up waiting was left holding a
+  # window the harness never came to close, so the signal above was swallowed and
+  # nothing this group asserts afterwards is measuring an interrupted arm.
+  gave_up=$(grep -m1 -F -- 'handshake-timeout ' "$TRACE" 2>/dev/null) || gave_up=''
+  if [[ -n $gave_up ]]; then
+    bad "the interrupt handshake was never dispatched: $gave_up"
+    if [[ -s $arm_out ]]; then
+      sed 's/^/       | /' "$arm_out"
+    fi
+    sed 's/^/       | /' "$TRACE"
+    return 0
+  fi
+  note "  arm catches SIG$signal, so that is the signal it was interrupted with"
   OUT=$(<"$arm_out")
   expect_rc 1 'the interrupted arm exits 1'
   expect_out 'interrupted while capturing' 'the abort is logged'
