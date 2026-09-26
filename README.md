@@ -510,12 +510,16 @@ bash tests/run.sh
 
 27 groups, all passing, on both sides of one condition: how many checks that
 is depends on whether `shellcheck` is on `PATH`. Without it the lint group
-prints two skip notes, lints no file, and the run is 246 checks in about 34
-seconds; with it the same group lints ten files and the run is 256 checks in
-about 46 seconds.
-Both figures come from this box today, the second from the same binary
-temporarily put on `PATH`, since nothing here installs packages. The CI suite
-job is the one that sees 256.
+prints two skip notes, lints no file, and the run is 246 checks; with it the
+same group lints ten files and the run is 256 checks. Fifteen sequential runs
+of `time bash tests/run.sh` here on 2026-09-26, nine without the binary and
+six with the 0.11.0 copy put on `PATH` by hand since nothing here installs
+packages, took 26.9 to 34.3 seconds plain and 30.8 to 38.5 linted. Six of
+those plain runs were taken straight before a linted one and spaced the ten
+files 1.7 to 5.8 seconds apart, while the load average on four cores drifted
+from 6.8 down to 2.6 across that window, so the two ranges overlap and under
+a minute either way is all the data holds. The CI suite job is the one that
+sees 256.
 
 Plain bash and coreutils: the
 box you administer has neither bats nor pytest, and a switch that can only be
